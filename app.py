@@ -1,7 +1,7 @@
 # ============================================================
-#  BOT TRIAL APP v6
-#  Strict polarity (L vs H must disagree by 2) + no fade after
-#  CHoCH/BOS through the zone. Same rules every session.
+#  BOT TRIAL APP v7
+#  Structural stops + one-bite-per-shelf (reset only on new BOS).
+#  Same rules every session. No date-specific logic.
 # ============================================================
 import streamlit as st
 import plotly.graph_objects as go
@@ -10,7 +10,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v6")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v7")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -23,11 +23,12 @@ BOS_FLAT_COOLDOWN = 5
 MIN_SWING_PCT = 0.0008
 WARMUP_BARS = 30
 STRONG_ZONE = 3
-STOP_NOISE_MULT = 1.0
+STOP_NOISE_MULT = 1.5
 NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
 STRUCT_TOUCHES = 3
-POLARITY_EDGE = 2          # H must beat L by this to be a shortable ceiling
+POLARITY_EDGE = 2
+SWING_STOP_NEAR = 0.0025   # last LL/HH within 0.25% of the zone counts as the structure stop
 
 C_HH = dict(fg="#ffffff", bg="#166534")
 C_LH = dict(fg="#ffffff", bg="#991b1b")
@@ -45,6 +46,9 @@ defaults = {
     "entry": None, "sl": None, "tp": None, "side": None,
     "step": 0, "df": pd.DataFrame(), "log": [], "start_idx": 0,
     "cooldown": 0, "markers": [],
+    "spent": [],          # [{"mid": float, "side": "LONG"/"SHORT", "bos_n": int}]
+    "zone_mid": None,     # shelf used by the open trade
+    "bos_n": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -232,7 +236,6 @@ def trend_state(bos, choch, i, labeled=None):
     return "NEUTRAL"
 
 def zone_role(z, close, noise):
-    """Display role. Trade role is stricter (see tradeable_*)."""
     if z["low_touches"] >= z["high_touches"] + POLARITY_EDGE:
         role = "floor"
     elif z["high_touches"] >= z["low_touches"] + POLARITY_EDGE:
@@ -255,7 +258,6 @@ def zone_broken_by_close(z, close, noise):
     return None
 
 def event_through_zone(z, bos, choch, i, noise):
-    """True if a CHoCH or BOS already printed through this zone (accepted break)."""
     buf = max(noise, z["mid"] * 0.0004)
     lo, hi = z["min_px"] - buf, z["max_px"] + buf
     for b in bos:
@@ -300,6 +302,38 @@ def nearest_above(zs, price, min_touches=MIN_DRAW_TOUCHES):
     above = [z for z in zs if z["mid"] > price and z["touches"] >= min_touches]
     return min(above, key=lambda z: z["mid"]) if above else None
 
+def structural_long_stop(z, labeled, i, price, noise):
+    """Beyond the last L-swing that tagged this floor — not the zone mid."""
+    conf = [s for s in labeled if s["i"] + SWING_K <= i and s["type"] == "L"]
+    near = max(price * SWING_STOP_NEAR, 3 * noise)
+    tagged = [s["price"] for s in conf if abs(s["price"] - z["mid"]) <= near]
+    structure = min(tagged) if tagged else z["min_px"]
+    structure = min(structure, z["min_px"])
+    buf = max(STOP_NOISE_MULT * noise, price * 0.0006)
+    return structure - buf
+
+def structural_short_stop(z, labeled, i, price, noise):
+    conf = [s for s in labeled if s["i"] + SWING_K <= i and s["type"] == "H"]
+    near = max(price * SWING_STOP_NEAR, 3 * noise)
+    tagged = [s["price"] for s in conf if abs(s["price"] - z["mid"]) <= near]
+    structure = max(tagged) if tagged else z["max_px"]
+    structure = max(structure, z["max_px"])
+    buf = max(STOP_NOISE_MULT * noise, price * 0.0006)
+    return structure + buf
+
+def shelf_spent(mid, side, price):
+    bos_n = st.session_state.bos_n
+    for s in st.session_state.spent:
+        if s["side"] == side and s["bos_n"] == bos_n:
+            if abs(s["mid"] - mid) / max(price, 1e-9) < ZONE_TOL * 2:
+                return True
+    return False
+
+def mark_spent(mid, side):
+    st.session_state.spent.append({
+        "mid": float(mid), "side": side, "bos_n": st.session_state.bos_n,
+    })
+
 def candle_signal(df, i):
     if i < 1:
         return None
@@ -340,7 +374,6 @@ def bot_decide(df, i, labeled, bos, choch, zones):
     floors, ceilings, boths = classify_zones(zones, price, noise)
     near = NEAR_ZONE_MULT * noise
 
-    # Mixed BOTH nearby → skip (mid-range / contested)
     both_here = pick_near(boths, price, near, MIN_TRADE_TOUCHES)
     if both_here is not None:
         return None
@@ -358,9 +391,9 @@ def bot_decide(df, i, labeled, bos, choch, zones):
         else:
             return None
 
-    # ----- LONG -----
     if sig == "bull" and floor_here is not None and ceil_here is None:
-        # already broken down through this floor → do not long it
+        if shelf_spent(floor_here["mid"], "LONG", price):
+            return None
         thru = event_through_zone(floor_here, bos, choch, i, noise)
         brk = zone_broken_by_close(floor_here, price, noise)
         if thru == "down" or brk == "down":
@@ -373,23 +406,26 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             target_pool = ceilings + boths
             target = nearest_above(target_pool, price, MIN_DRAW_TOUCHES)
             if target is not None:
-                slp = floor_here["min_px"] - max(STOP_NOISE_MULT * noise, price * 0.0004)
+                slp = structural_long_stop(floor_here, labeled, i, price, noise)
                 tpp = target["mid"] - 0.4 * noise
+                if slp >= price:
+                    return None
                 risk, reward = price - slp, tpp - price
                 if risk > 0 and reward / risk >= MIN_RR:
                     tag = "double-bottom override" if trend == "BEAR" else trend
                     return {
                         "side": "LONG", "sl": round(slp, 2), "tp": round(tpp, 2),
+                        "zone_mid": floor_here["mid"],
                         "why": (f"{tag} | FLOOR {floor_here['mid']:.2f} "
                                 f"({floor_here['low_touches']}L/{floor_here['touches']}x) "
                                 f"| RR {reward/risk:.1f}"),
                     }
 
-    # ----- SHORT -----
     if sig == "bear" and ceil_here is not None and floor_here is None:
+        if shelf_spent(ceil_here["mid"], "SHORT", price):
+            return None
         thru = event_through_zone(ceil_here, bos, choch, i, noise)
         brk = zone_broken_by_close(ceil_here, price, noise)
-        # CHoCH↑ / BOS↑ through this ceiling → do not fade it
         if thru == "up" or brk == "up":
             return None
         if ceil_here["high_touches"] < ceil_here["low_touches"] + POLARITY_EDGE:
@@ -400,13 +436,16 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             target_pool = floors + boths
             target = nearest_below(target_pool, price, MIN_DRAW_TOUCHES)
             if target is not None:
-                slp = ceil_here["max_px"] + max(STOP_NOISE_MULT * noise, price * 0.0004)
+                slp = structural_short_stop(ceil_here, labeled, i, price, noise)
                 tpp = target["mid"] + 0.4 * noise
+                if slp <= price:
+                    return None
                 risk, reward = slp - price, price - tpp
                 if risk > 0 and reward / risk >= MIN_RR:
                     tag = "double-top override" if trend == "BULL" else trend
                     return {
                         "side": "SHORT", "sl": round(slp, 2), "tp": round(tpp, 2),
+                        "zone_mid": ceil_here["mid"],
                         "why": (f"{tag} | CEILING {ceil_here['mid']:.2f} "
                                 f"({ceil_here['high_touches']}H/{ceil_here['touches']}x) "
                                 f"| RR {reward/risk:.1f}"),
@@ -421,6 +460,8 @@ def _close_long(px, t, kind, reason=""):
         st.session_state.cooldown = COOLDOWN_BARS
     elif kind == "TP":
         st.session_state.log.append(f"{t}: 🎯 LONG target ${px:.2f}")
+        if st.session_state.zone_mid is not None:
+            mark_spent(st.session_state.zone_mid, "LONG")
     else:
         st.session_state.log.append(f"{t}: ⚡ LONG flattened ${px:.2f} — {reason}")
         st.session_state.cooldown = BOS_FLAT_COOLDOWN
@@ -428,6 +469,7 @@ def _close_long(px, t, kind, reason=""):
     st.session_state.shares = 0
     st.session_state.sl = st.session_state.tp = st.session_state.entry = None
     st.session_state.side = None
+    st.session_state.zone_mid = None
 
 def _close_short(px, t, kind, reason=""):
     sh = abs(st.session_state.shares)
@@ -437,6 +479,8 @@ def _close_short(px, t, kind, reason=""):
         st.session_state.cooldown = COOLDOWN_BARS
     elif kind == "TP":
         st.session_state.log.append(f"{t}: 🎯 SHORT covered ${px:.2f}")
+        if st.session_state.zone_mid is not None:
+            mark_spent(st.session_state.zone_mid, "SHORT")
     else:
         st.session_state.log.append(f"{t}: ⚡ SHORT flattened ${px:.2f} — {reason}")
         st.session_state.cooldown = BOS_FLAT_COOLDOWN
@@ -444,6 +488,7 @@ def _close_short(px, t, kind, reason=""):
     st.session_state.shares = 0
     st.session_state.sl = st.session_state.tp = st.session_state.entry = None
     st.session_state.side = None
+    st.session_state.zone_mid = None
 
 def advance(steps):
     for _ in range(steps):
@@ -457,6 +502,7 @@ def advance(steps):
         t = c["label"]
         visible = df.iloc[: i + 1]
         labeled, bos, choch = detect_structure(visible)
+        st.session_state.bos_n = len(bos)
 
         if st.session_state.shares != 0:
             sh, sl, tp = st.session_state.shares, st.session_state.sl, st.session_state.tp
@@ -498,6 +544,7 @@ def advance(steps):
             st.session_state.sl = decision["sl"]
             st.session_state.tp = decision["tp"]
             st.session_state.side = decision["side"]
+            st.session_state.zone_mid = decision.get("zone_mid")
             st.session_state.log.append(
                 f"{t}: 🤖 {decision['side']} ${TRADE_AMT:.0f} at ${px:.2f} "
                 f"(SL {decision['sl']} / TP {decision['tp']}) — {decision['why']}"
@@ -514,10 +561,11 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v6")
+st.title("🤖 Auto-Trader Bot — Trial v7")
 st.caption(
-    "Same rules every session. **Floor/ceiling must win by 2 touches** (else BOTH, not traded). "
-    "**No fade** of a zone after CHoCH/BOS through it. Structural BOS still ignores pivots inside a 3+ shelf."
+    "Same rules every session. **Stop** = last swing that tagged the shelf, not the zone mid. "
+    "**One bite per shelf** after a TP until a **new BOS**. Polarity still needs a 2-touch edge. "
+    "No fade after CHoCH/BOS through the zone."
 )
 
 st.sidebar.header("Setup")
@@ -526,8 +574,7 @@ day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 st.sidebar.markdown(
-    f"`POLARITY_EDGE={POLARITY_EDGE}` · trade **{MIN_TRADE_TOUCHES}+** · "
-    f"no short after CHoCH↑/BOS↑ through the zone"
+    f"structural stop · one-bite until BOS · `POLARITY_EDGE={POLARITY_EDGE}`"
 )
 
 raw = fetch_session(ticker, day)
@@ -554,6 +601,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
     zones = build_zones(conf, price)
     trend = trend_state(bos, choch, i, labeled)
     noise = float((vis["high"] - vis["low"]).iloc[max(0, len(vis) - 20):].mean() or 0.3)
+    st.session_state.bos_n = len(bos)
 
     pos_val = st.session_state.shares * price
     equity = st.session_state.balance + pos_val
@@ -638,7 +686,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         template="plotly_white", height=660, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v6 session-only | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v7 session-only | {trend}",
         margin=dict(r=160),
     )
     fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb", linecolor="#111111")
@@ -658,4 +706,4 @@ if st.session_state.active and len(st.session_state.df) > 0:
             for line in reversed(st.session_state.log):
                 st.text(line)
 else:
-    st.info("Pick any recent date and press Start. Grade polarity + no-fade-after-break — not PnL.")
+    st.info("Pick any recent date and press Start. Grade **stop location** and **no second bite** — not PnL.")
