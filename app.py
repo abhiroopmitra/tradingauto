@@ -1,5 +1,6 @@
 # ============================================================
-#  BOT TRIAL APP v4
+#  BOT TRIAL APP v5
+#  Structural BOS: last HH/LL that is NOT inside a 3+ touch zone.
 #  Same rules every session. No date-specific logic.
 # ============================================================
 import streamlit as st
@@ -9,30 +10,30 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v4")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v5")
 
 # ==========================================
-# UNIVERSAL KNOBS — one set for every ticker / every day
+# UNIVERSAL KNOBS
 # ==========================================
 TRADE_AMT = 200.0
 SWING_K = 5
-ZONE_TOL = 0.0012          # 0.12% cluster
-MIN_DRAW_TOUCHES = 2       # draw the line
-MIN_TRADE_TOUCHES = 3      # actually trade it (concrete, not wood)
+ZONE_TOL = 0.0012
+MIN_DRAW_TOUCHES = 2
+MIN_TRADE_TOUCHES = 3
 MIN_RR = 1.2
-COOLDOWN_BARS = 15         # after a stop-out
-BOS_FLAT_COOLDOWN = 5      # after flattening on adverse BOS
+COOLDOWN_BARS = 15
+BOS_FLAT_COOLDOWN = 5
 MIN_SWING_PCT = 0.0008
 WARMUP_BARS = 30
-STRONG_ZONE = 3            # 3+ same-side touches may fade last BOS
-STOP_NOISE_MULT = 1.0      # extra buffer beyond the swing extreme
-NEAR_ZONE_MULT = 1.2       # must be hugging the zone
+STRONG_ZONE = 3
+STOP_NOISE_MULT = 1.0
+NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
+STRUCT_TOUCHES = 3          # a zone this strong "contains" internal pivots
 
-# High-contrast badge palette (readable on a light chart)
-C_HH = dict(fg="#ffffff", bg="#166534")   # dark green
-C_LH = dict(fg="#ffffff", bg="#991b1b")   # dark red
-C_H  = dict(fg="#ffffff", bg="#334155")   # slate
+C_HH = dict(fg="#ffffff", bg="#166534")
+C_LH = dict(fg="#ffffff", bg="#991b1b")
+C_H  = dict(fg="#ffffff", bg="#334155")
 C_BOS_UP = dict(fg="#111111", bg="#f5c518")
 C_BOS_DN = dict(fg="#ffffff", bg="#b91c1c")
 C_CH_UP  = dict(fg="#111111", bg="#7dd3fc")
@@ -41,9 +42,6 @@ C_FLOOR  = "#166534"
 C_CEIL   = "#991b1b"
 C_BROKEN = "#78716c"
 
-# ==========================================
-# 1. SESSION STATE
-# ==========================================
 defaults = {
     "active": False, "balance": 1000.0, "shares": 0.0,
     "entry": None, "sl": None, "tp": None, "side": None,
@@ -54,9 +52,6 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ==========================================
-# 2. DATA — chosen calendar day, RTH only
-# ==========================================
 @st.cache_data(ttl=3600)
 def fetch_session(ticker, day):
     start = pd.Timestamp(day)
@@ -88,22 +83,11 @@ def fetch_session(ticker, day):
     df["label"] = df["timestamp"].dt.strftime("%H:%M")
     return df.reset_index(drop=True)
 
-# ==========================================
-# 3. STRUCTURE
-#    Swings confirmed only at index + SWING_K (no lookahead).
-#    First H / L of the session are labels only — not BOS levels.
-#    BOS  = trend-changing close beyond last HH / last LL.
-#    CHoCH = close beyond last HL (from BULL) or last LH (from BEAR).
-# ==========================================
-def detect_structure(df):
-    if df is None or len(df) < SWING_K * 2 + 1:
-        return [], [], []
-
+def _raw_swings(df):
     highs, lows = df["high"].values, df["low"].values
     n = len(df)
     ref = float(df["close"].iloc[-1])
     min_size = max(ref * MIN_SWING_PCT, 1e-6)
-
     raw = []
     for i in range(SWING_K, n - SWING_K):
         wh = highs[i - SWING_K: i + SWING_K + 1]
@@ -113,7 +97,6 @@ def detect_structure(df):
         if lows[i] == wl.min() and (wh.max() - lows[i]) >= min_size:
             raw.append((i, float(lows[i]), "L"))
     raw.sort(key=lambda x: x[0])
-
     cleaned = []
     for s in raw:
         if cleaned and cleaned[-1][2] == s[2]:
@@ -122,7 +105,6 @@ def detect_structure(df):
                 cleaned[-1] = s
         else:
             cleaned.append(s)
-
     labeled, last_h, last_l = [], None, None
     for idx, price, typ in cleaned:
         if typ == "H":
@@ -132,28 +114,93 @@ def detect_structure(df):
             lab = "L" if last_l is None else ("HL" if price > last_l else "LL")
             last_l = price
         labeled.append({"i": idx, "price": price, "type": typ, "label": lab})
+    return labeled
 
+def build_zones(labeled, ref_price):
+    zones = []
+    for s in labeled:
+        placed = False
+        for z in zones:
+            if abs(s["price"] - z["mid"]) / max(ref_price, 1e-9) < ZONE_TOL:
+                z["prices"].append(s["price"])
+                z["mid"] = float(np.mean(z["prices"]))
+                z["touches"] += 1
+                if s["type"] == "L":
+                    z["low_touches"] += 1
+                else:
+                    z["high_touches"] += 1
+                placed = True
+                break
+        if not placed:
+            zones.append({
+                "mid": s["price"],
+                "prices": [s["price"]],
+                "touches": 1,
+                "low_touches": 1 if s["type"] == "L" else 0,
+                "high_touches": 1 if s["type"] == "H" else 0,
+            })
+    out = [z for z in zones if z["touches"] >= MIN_DRAW_TOUCHES]
+    for z in out:
+        z["min_px"] = min(z["prices"])
+        z["max_px"] = max(z["prices"])
+    return out
+
+def _inside_strong_floor(price, zones, noise):
+    """True if this low is still *inside* a 3+ L-touch floor (not a break of it)."""
+    buf = max(noise, (abs(price) * 0.0004) if price else 0.01)
+    for z in zones:
+        if z["low_touches"] >= STRUCT_TOUCHES and z["low_touches"] > z["high_touches"]:
+            if price >= z["min_px"] - buf:
+                # sitting on or above the floor extreme → not a structural LL
+                if abs(price - z["mid"]) <= max(4 * buf, z["max_px"] - z["min_px"] + buf):
+                    return True
+    return False
+
+def _inside_strong_ceiling(price, zones, noise):
+    buf = max(noise, (abs(price) * 0.0004) if price else 0.01)
+    for z in zones:
+        if z["high_touches"] >= STRUCT_TOUCHES and z["high_touches"] > z["low_touches"]:
+            if price <= z["max_px"] + buf:
+                if abs(price - z["mid"]) <= max(4 * buf, z["max_px"] - z["min_px"] + buf):
+                    return True
+    return False
+
+def detect_structure(df):
+    """Labels = local staircase. BOS = close beyond last *structural* HH/LL."""
+    if df is None or len(df) < SWING_K * 2 + 1:
+        return [], [], []
+
+    labeled = _raw_swings(df)
+    n = len(df)
     bos, choch = [], []
     last_hh = last_hl = last_lh = last_ll = None
     bias = "NEUTRAL"
     ptr = 0
+    noise_series = (df["high"] - df["low"])
+
     for i in range(n):
+        noise = float(noise_series.iloc[max(0, i - 20): i + 1].mean() or 0.3)
+        # zones from swings confirmed so far (no lookahead)
+        conf_now = [s for s in labeled if s["i"] + SWING_K <= i]
+        zones_now = build_zones(conf_now, float(df["close"].iloc[i]))
+
         while ptr < len(labeled) and labeled[ptr]["i"] + SWING_K <= i:
             s = labeled[ptr]
             if s["label"] == "HH":
-                last_hh = s["price"]
+                if not _inside_strong_ceiling(s["price"], zones_now, noise):
+                    last_hh = s["price"]
             elif s["label"] == "HL":
                 last_hl = s["price"]
             elif s["label"] == "LH":
                 last_lh = s["price"]
             elif s["label"] == "LL":
-                last_ll = s["price"]
-            # first H / L intentionally do NOT seed BOS levels
+                if not _inside_strong_floor(s["price"], zones_now, noise):
+                    last_ll = s["price"]
+            # first H / L still do not seed BOS
             ptr += 1
 
         c = float(df["close"].iloc[i])
 
-        # Trend-changing BOS only. Continuation breaks stay silent.
         if last_hh is not None and c > last_hh:
             if bias != "BULL":
                 bos.append({"i": i, "price": last_hh, "dir": "up"})
@@ -192,7 +239,6 @@ def trend_state(bos, choch, i, labeled=None):
         if kind == "BOS":
             return "BULL" if direction == "up" else "BEAR"
         return "NEUTRAL"
-
     if not labeled:
         return "NEUTRAL"
     confirmed = [s for s in labeled if s["i"] + SWING_K <= i]
@@ -204,40 +250,6 @@ def trend_state(bos, choch, i, labeled=None):
     if bear >= 3 and bear > bull:
         return "BEAR"
     return "NEUTRAL"
-
-# ==========================================
-# 4. S/R — sticky floor / ceiling
-#    Role = how the zone was built (L-swings vs H-swings).
-#    Flip only on a CLOSE through the zone.
-# ==========================================
-def build_zones(labeled, ref_price):
-    zones = []
-    for s in labeled:
-        placed = False
-        for z in zones:
-            if abs(s["price"] - z["mid"]) / max(ref_price, 1e-9) < ZONE_TOL:
-                z["prices"].append(s["price"])
-                z["mid"] = float(np.mean(z["prices"]))
-                z["touches"] += 1
-                if s["type"] == "L":
-                    z["low_touches"] += 1
-                else:
-                    z["high_touches"] += 1
-                placed = True
-                break
-        if not placed:
-            zones.append({
-                "mid": s["price"],
-                "prices": [s["price"]],
-                "touches": 1,
-                "low_touches": 1 if s["type"] == "L" else 0,
-                "high_touches": 1 if s["type"] == "H" else 0,
-            })
-    out = [z for z in zones if z["touches"] >= MIN_DRAW_TOUCHES]
-    for z in out:
-        z["min_px"] = min(z["prices"])
-        z["max_px"] = max(z["prices"])
-    return out
 
 def zone_role(z, close, noise):
     if z["low_touches"] > z["high_touches"]:
@@ -273,7 +285,6 @@ def classify_zones(zones, price, noise):
     return floors, ceilings
 
 def pick_near(zones, price, near, min_touches):
-    """Prefer more touches, then closer. 2-touch wood loses to 4-touch concrete."""
     cand = [z for z in zones
             if z["touches"] >= min_touches and abs(z["mid"] - price) <= near]
     if not cand:
@@ -289,9 +300,6 @@ def nearest_above(zs, price, min_touches=MIN_DRAW_TOUCHES):
     above = [z for z in zs if z["mid"] > price and z["touches"] >= min_touches]
     return min(above, key=lambda z: z["mid"]) if above else None
 
-# ==========================================
-# 5. CANDLES — trigger only. Location still required.
-# ==========================================
 def candle_signal(df, i):
     if i < 1:
         return None
@@ -319,9 +327,6 @@ def candle_signal(df, i):
             return "bear"
     return None
 
-# ==========================================
-# 6. BOT BRAIN
-# ==========================================
 def bot_decide(df, i, labeled, bos, choch, zones):
     price = float(df["close"].iloc[i])
     noise = float((df["high"] - df["low"]).iloc[max(0, i - 20): i + 1].mean())
@@ -334,11 +339,9 @@ def bot_decide(df, i, labeled, bos, choch, zones):
 
     floors, ceilings = classify_zones(zones, price, noise)
     near = NEAR_ZONE_MULT * noise
-
     floor_here = pick_near(floors, price, near, MIN_TRADE_TOUCHES)
     ceil_here = pick_near(ceilings, price, near, MIN_TRADE_TOUCHES)
 
-    # Mid-range: both concrete shelves nearby → no trade
     if floor_here is not None and ceil_here is not None:
         d_f = abs(price - floor_here["mid"])
         d_c = abs(price - ceil_here["mid"])
@@ -349,7 +352,6 @@ def bot_decide(df, i, labeled, bos, choch, zones):
         else:
             return None
 
-    # ----- LONG: hugging a concrete floor, not a ceiling -----
     if sig == "bull" and floor_here is not None and ceil_here is None:
         strong_bottom = floor_here["low_touches"] >= STRONG_ZONE
         allow = (trend != "BEAR") or strong_bottom
@@ -368,7 +370,6 @@ def bot_decide(df, i, labeled, bos, choch, zones):
                                 f"| RR {reward/risk:.1f}"),
                     }
 
-    # ----- SHORT: hugging a concrete ceiling, not a floor -----
     if sig == "bear" and ceil_here is not None and floor_here is None:
         strong_top = ceil_here["high_touches"] >= STRONG_ZONE
         allow = (trend != "BULL") or strong_top
@@ -388,9 +389,6 @@ def bot_decide(df, i, labeled, bos, choch, zones):
                     }
     return None
 
-# ==========================================
-# 7. TIME ADVANCE + EXECUTION
-# ==========================================
 def _close_long(px, t, kind, reason=""):
     sh = st.session_state.shares
     st.session_state.balance += sh * px
@@ -436,7 +434,6 @@ def advance(steps):
         visible = df.iloc[: i + 1]
         labeled, bos, choch = detect_structure(visible)
 
-        # --- manage open position ---
         if st.session_state.shares != 0:
             sh, sl, tp = st.session_state.shares, st.session_state.sl, st.session_state.tp
             if sh > 0:
@@ -444,19 +441,16 @@ def advance(steps):
                     _close_long(min(sl, float(c["open"])), t, "SL")
                 elif c["high"] >= tp:
                     _close_long(max(tp, float(c["open"])), t, "TP")
-                else:
-                    # adverse BOS↓ this bar → flatten at close
-                    if any(b["i"] == i and b["dir"] == "down" for b in bos):
-                        _close_long(float(c["close"]), t, "FLAT", "BOS↓ against long")
+                elif any(b["i"] == i and b["dir"] == "down" for b in bos):
+                    _close_long(float(c["close"]), t, "FLAT", "BOS↓ against long")
             else:
                 if c["high"] >= sl:
                     _close_short(max(sl, float(c["open"])), t, "SL")
                 elif c["low"] <= tp:
                     _close_short(min(tp, float(c["open"])), t, "TP")
-                else:
-                    if any(b["i"] == i and b["dir"] == "up" for b in bos):
-                        _close_short(float(c["close"]), t, "FLAT", "BOS↑ against short")
-            continue  # never open the same bar as an exit
+                elif any(b["i"] == i and b["dir"] == "up" for b in bos):
+                    _close_short(float(c["close"]), t, "FLAT", "BOS↑ against short")
+            continue
 
         if st.session_state.cooldown > 0:
             st.session_state.cooldown -= 1
@@ -486,9 +480,6 @@ def advance(steps):
             )
             st.session_state.markers.append((t, px, decision["side"]))
 
-# ==========================================
-# 8. CHART HELPERS
-# ==========================================
 def badge(fig, x, y, text, pal, yshift=0, arrow=False):
     fig.add_annotation(
         x=x, y=y, text=f"<b>{text}</b>",
@@ -499,15 +490,12 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-# ==========================================
-# 9. UI
-# ==========================================
-st.title("🤖 Auto-Trader Bot — Trial v4")
+st.title("🤖 Auto-Trader Bot — Trial v5")
 st.caption(
-    "Same rules every session. **BOS** = first close beyond last HH / last LL that **changes trend** "
-    "(continuation breaks are not labelled). **CHoCH** = close beyond last HL / last LH → NEUTRAL. "
-    "2-touch zones are drawn; **3+ touches** to trade. Stop is beyond the swing that built the zone. "
-    "Adverse BOS flattens the position. Never short a live floor / never long a live ceiling."
+    "Same rules every session. **BOS** = close beyond last **structural** HH / LL "
+    "(a pivot **inside** a 3+ touch floor/ceiling does not count). "
+    "**CHoCH** = HL / LH break → NEUTRAL. 2-touch drawn, 3+ traded. "
+    "Adverse BOS flattens. Never short a live floor / never long a live ceiling."
 )
 
 st.sidebar.header("Setup")
@@ -516,8 +504,8 @@ day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 st.sidebar.markdown(
-    f"`SWING_K={SWING_K}` · trade **{MIN_TRADE_TOUCHES}+** touches · "
-    f"`MIN_RR={MIN_RR}` · near={NEAR_ZONE_MULT}×range"
+    f"`SWING_K={SWING_K}` · trade **{MIN_TRADE_TOUCHES}+** · "
+    f"structural BOS ignores pivots inside {STRUCT_TOUCHES}+ zones"
 )
 st.sidebar.markdown(
     """
@@ -657,7 +645,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False,
         font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v4 session-only | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v5 session-only | {trend}",
         margin=dict(r=160),
     )
     fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb",
@@ -678,4 +666,4 @@ if st.session_state.active and len(st.session_state.df) > 0:
             for line in reversed(st.session_state.log):
                 st.text(line)
 else:
-    st.info("Pick any recent date and press Start. Grade whether the **rules** fired — not whether that day was profitable.")
+    st.info("Pick any recent date and press Start. Grade **structural BOS** first — not PnL.")
