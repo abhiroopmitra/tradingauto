@@ -570,11 +570,15 @@ if st.session_state.active and len(st.session_state.df) > 0:
     )
     c4.metric("Trend (last BOS / CHoCH)", trend)
 
-    fig = go.Figure([go.Candlestick(
-        x=vis["label"], open=vis["open"], high=vis["high"],
-        low=vis["low"], close=vis["close"], name="price",
-        increasing_line_color="#15803d", increasing_fill_color="#22c55e",
-        decreasing_line_color="#b91c1c", decreasing_fill_color="#ef4444",
+        fig = go.Figure([go.Candlestick(
+        x=vis["label"],
+        open=vis["open"],
+        high=vis["high"],
+        low=vis["low"],
+        close=vis["close"],
+        name="price",
+        increasing=dict(line=dict(color="#15803d"), fillcolor="#22c55e"),
+        decreasing=dict(line=dict(color="#b91c1c"), fillcolor="#ef4444"),
     )])
 
     if show_struct:
