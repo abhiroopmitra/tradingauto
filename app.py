@@ -1,6 +1,6 @@
 # ============================================================
-#  BOT TRIAL APP v2 - Auto Structure + Auto Trading
-#  Past days = analysis only. Chart = current day only.
+#  BOT TRIAL APP v2 - CURRENT SESSION ONLY
+#  Structure / S/R / BOS / trades never look at prior days
 # ============================================================
 import streamlit as st
 import plotly.graph_objects as go
@@ -9,17 +9,11 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v2")
 
-# ---------------- CONFIG ----------------
-TRADE_AMT = 200.0
-SWING_K = 8            # bars each side to confirm swing
-ZONE_TOL = 0.0012      # zone clustering tolerance
-MIN_RR = 1.2           # minimum reward/risk
-COOLDOWN_BARS = 15     # no-trade window after stop-out
-MAX_ZONES_SHOWN = 3    # nearest zones each side drawn on chart
-
-# ---------------- STATE ----------------
+# ==========================================
+# 1. SESSION STATE
+# ==========================================
 defaults = {
     "active": False, "balance": 1000.0, "shares": 0.0,
     "entry": None, "sl": None, "tp": None, "side": None,
@@ -30,321 +24,431 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ---------------- DATA ----------------
+TRADE_AMT = 200.0
+SWING_K = 5          # 5 bars each side on 1m ≈ 10-min swing (was 8)
+ZONE_TOL = 0.0012    # 0.12% cluster for S/R
+MIN_RR = 1.2
+COOLDOWN_BARS = 15
+MIN_SWING_PCT = 0.0008   # ignore wiggles smaller than 0.08% (~$0.58 on QQQ@720)
+WARMUP_BARS = 30         # no trades until the open has some structure
+
+# ==========================================
+# 2. DATA — selected calendar day, RTH only, no 7-day lookback
+# ==========================================
 @st.cache_data(ttl=3600)
-def fetch(ticker, day):
-    start = day - timedelta(days=7)
-    end = day + timedelta(days=1)
-    d = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"), interval="1m",
-                    auto_adjust=True, progress=False)
-    if d.empty: return None
+def fetch_session(ticker, day):
+    """1-minute bars for `day` only, regular hours 9:30–16:00 ET."""
+    start = pd.Timestamp(day)
+    end = start + timedelta(days=1)
+    d = yf.download(
+        ticker,
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval="1m",
+        auto_adjust=True,
+        progress=False,
+        prepost=False,          # no pre/post market
+    )
+    if d is None or d.empty:
+        return None
     if isinstance(d.columns, pd.MultiIndex):
         d.columns = d.columns.get_level_values(0)
     df = d.reset_index()
     df.columns = [str(c).lower() for c in df.columns]
     df.rename(columns={df.columns[0]: "timestamp"}, inplace=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    # Normalise to US/Eastern so 9:30 means the cash open
     if df["timestamp"].dt.tz is not None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+        df["timestamp"] = df["timestamp"].dt.tz_convert("America/New_York")
+    tod = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
+    df = df[(tod >= 9 * 60 + 30) & (tod < 16 * 60)].copy()
+    df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
     df = df.dropna(subset=["close"]).drop_duplicates(subset="timestamp")
-    df["date_only"] = df["timestamp"].dt.date
+    df = df[df["timestamp"].dt.date == day].copy()
     df["label"] = df["timestamp"].dt.strftime("%H:%M")
     return df.reset_index(drop=True)
 
-# ---------------- STRUCTURE ENGINE ----------------
+# ==========================================
+# 3. STRUCTURE ENGINE — session-local, no lookahead
+# ==========================================
 def detect_structure(df):
-    """Confirmed swings only (no lookahead beyond SWING_K)."""
+    """HH/HL/LH/LL + BOS using ONLY the bars in `df` (already today)."""
+    if df is None or len(df) < SWING_K * 2 + 1:
+        return [], []
+
     highs, lows = df["high"].values, df["low"].values
     n = len(df)
-    swings = []
+    ref = float(df["close"].iloc[-1])
+    min_size = max(ref * MIN_SWING_PCT, 1e-6)
+
+    raw = []
     for i in range(SWING_K, n - SWING_K):
-        if highs[i] == max(highs[i-SWING_K:i+SWING_K+1]):
-            swings.append((i, highs[i], "H"))
-        if lows[i] == min(lows[i-SWING_K:i+SWING_K+1]):
-            swings.append((i, lows[i], "L"))
-    swings.sort(key=lambda x: x[0])
+        window_h = highs[i - SWING_K: i + SWING_K + 1]
+        window_l = lows[i - SWING_K: i + SWING_K + 1]
+        if highs[i] == window_h.max() and (highs[i] - window_l.min()) >= min_size:
+            raw.append((i, float(highs[i]), "H"))
+        if lows[i] == window_l.min() and (window_h.max() - lows[i]) >= min_size:
+            raw.append((i, float(lows[i]), "L"))
+    raw.sort(key=lambda x: x[0])
+
+    # Keep the more extreme of two consecutive same-type swings
     cleaned = []
-    for s in swings:
+    for s in raw:
         if cleaned and cleaned[-1][2] == s[2]:
             if (s[2] == "H" and s[1] >= cleaned[-1][1]) or \
                (s[2] == "L" and s[1] <= cleaned[-1][1]):
                 cleaned[-1] = s
         else:
             cleaned.append(s)
+
+    # First high/low of the DAY are just H / L — never HL vs yesterday
     labeled, last_h, last_l = [], None, None
     for idx, price, typ in cleaned:
         if typ == "H":
-            lab = "HH" if (last_h is not None and price > last_h) else "LH"
+            lab = "H" if last_h is None else ("HH" if price > last_h else "LH")
             last_h = price
         else:
-            lab = "HL" if (last_l is not None and price > last_l) else "LL"
+            lab = "L" if last_l is None else ("HL" if price > last_l else "LL")
             last_l = price
         labeled.append({"i": idx, "price": price, "type": typ, "label": lab})
 
-    # BOS detection
+    # BOS: close beyond the most recently *confirmed* session swing
+    # A swing at bar j is confirmed only once j+SWING_K bars exist.
     bos, lh, ll_, ptr = [], None, None, 0
     for i in range(n):
         while ptr < len(labeled) and labeled[ptr]["i"] + SWING_K <= i:
             s = labeled[ptr]
-            if s["type"] == "H": lh = s["price"]
-            else: ll_ = s["price"]
+            if s["type"] == "H":
+                lh = s["price"]
+            else:
+                ll_ = s["price"]
             ptr += 1
-        c = df["close"].iloc[i]
+        c = float(df["close"].iloc[i])
         if lh is not None and c > lh:
-            bos.append({"i": i, "price": lh, "dir": "up"}); lh = None
-        if ll_ is not None and c < ll_:
-            bos.append({"i": i, "price": ll_, "dir": "down"}); ll_ = None
+            bos.append({"i": i, "price": lh, "dir": "up"})
+            lh = None
+        elif ll_ is not None and c < ll_:
+            bos.append({"i": i, "price": ll_, "dir": "down"})
+            ll_ = None
     return labeled, bos
 
-def trend_state(labeled):
-    labs = [s["label"] for s in labeled[-4:]]
+def trend_state(labeled, bos, i):
+    """Permission comes from the last SESSION BOS; labels are fallback."""
+    last_bos = None
+    for b in bos:
+        if b["i"] <= i:
+            last_bos = b
+    if last_bos is not None:
+        return "BULL" if last_bos["dir"] == "up" else "BEAR"
+
+    confirmed = [s for s in labeled if s["i"] + SWING_K <= i]
+    labs = [s["label"] for s in confirmed[-4:] if s["label"] in ("HH", "HL", "LH", "LL")]
+    if not labs:
+        return "NEUTRAL"
     bull = labs.count("HH") + labs.count("HL")
     bear = labs.count("LH") + labs.count("LL")
-    if bull >= 3: return "BULL"
-    if bear >= 3: return "BEAR"
+    if bull >= 3:
+        return "BULL"
+    if bear >= 3:
+        return "BEAR"
     return "NEUTRAL"
 
+# ==========================================
+# 4. S/R ZONES — today's swings, 2+ touches = concrete
+# ==========================================
 def build_zones(labeled, ref_price):
     zones = []
     for s in labeled:
         placed = False
         for z in zones:
-            if abs(s["price"] - z["mid"]) / ref_price < ZONE_TOL:
+            if abs(s["price"] - z["mid"]) / max(ref_price, 1e-9) < ZONE_TOL:
                 z["prices"].append(s["price"])
-                z["mid"] = np.mean(z["prices"]); z["touches"] += 1
-                placed = True; break
+                z["mid"] = float(np.mean(z["prices"]))
+                z["touches"] += 1
+                placed = True
+                break
         if not placed:
             zones.append({"mid": s["price"], "prices": [s["price"]], "touches": 1})
     return [z for z in zones if z["touches"] >= 2]
 
-# ---------------- CANDLE PATTERNS ----------------
+# ==========================================
+# 5. CANDLE PATTERNS (unchanged idea)
+# ==========================================
 def candle_signal(df, i):
-    if i < 2: return None
-    o, h, l, c = df["open"].iloc[i], df["high"].iloc[i], df["low"].iloc[i], df["close"].iloc[i]
-    po, pc = df["open"].iloc[i-1], df["close"].iloc[i-1]
+    if i < 1:
+        return None
+    o, h, l, c = (df["open"].iloc[i], df["high"].iloc[i],
+                   df["low"].iloc[i], df["close"].iloc[i])
+    po, pc = df["open"].iloc[i - 1], df["close"].iloc[i - 1]
     body = abs(c - o)
-    up_w = h - max(o, c); dn_w = min(o, c) - l
-    if pc < po and c > o and c >= po and o <= pc: return "bull"      # engulfing
-    if dn_w > 2*body and up_w < body and c >= o: return "bull"       # hammer
-    if pc > po and c < o and c <= po and o >= pc: return "bear"
-    if up_w > 2*body and dn_w < body and c <= o: return "bear"       # shooting star
-    avg = (df["high"] - df["low"]).iloc[max(0,i-20):i].mean()
-    b1, b2 = pc - po, c - o
-    if b1 > 0.3*avg and b2 > 0.3*avg: return "bull"                  # 2 strong greens
-    if b1 < -0.3*avg and b2 < -0.3*avg: return "bear"                # 2 strong reds
+    up_wick = h - max(o, c)
+    dn_wick = min(o, c) - l
+
+    if pc < po and c > o and c >= po and o <= pc:
+        return "bull"                          # bullish engulfing
+    if dn_wick > 2 * body and up_wick < body and c >= o:
+        return "bull"                          # hammer
+    if pc > po and c < o and c <= po and o >= pc:
+        return "bear"                          # bearish engulfing
+    if up_wick > 2 * body and dn_wick < body and c <= o:
+        return "bear"                          # shooting star
+    if i >= 2:
+        b1 = df["close"].iloc[i - 1] - df["open"].iloc[i - 1]
+        b2 = c - o
+        avg = (df["high"] - df["low"]).iloc[max(0, i - 20):i].mean()
+        if avg and b1 > 0.3 * avg and b2 > 0.3 * avg:
+            return "bull"
+        if avg and b1 < -0.3 * avg and b2 < -0.3 * avg:
+            return "bear"
     return None
 
-# ---------------- BOT BRAIN ----------------
-def bot_decide(df, i, labeled, zones):
-    price = df["close"].iloc[i]
-    noise = (df["high"] - df["low"]).iloc[max(0,i-20):i+1].mean()
-    trend = trend_state([s for s in labeled if s["i"] + SWING_K <= i])
+# ==========================================
+# 6. BOT BRAIN
+# ==========================================
+def bot_decide(df, i, labeled, bos, zones):
+    price = float(df["close"].iloc[i])
+    noise = float((df["high"] - df["low"]).iloc[max(0, i - 20): i + 1].mean())
+    trend = trend_state(labeled, bos, i)
     sig = candle_signal(df, i)
+
     sup = [z for z in zones if z["mid"] < price]
     res = [z for z in zones if z["mid"] > price]
-    ns = max(sup, key=lambda z: z["mid"]) if sup else None
-    nr = min(res, key=lambda z: z["mid"]) if res else None
+    nearest_sup = max(sup, key=lambda z: z["mid"]) if sup else None
+    nearest_res = min(res, key=lambda z: z["mid"]) if res else None
 
-    if trend != "BEAR" and sig == "bull" and ns and nr:
-        if (price - ns["mid"]) < 2.5 * noise:                        # near floor
-            slp = ns["mid"] - max(1.5*noise, price*0.0005)           # beyond structure
-            tpp = nr["mid"] - 0.5*noise                              # nearest shelf
-            risk, rew = price - slp, tpp - price
-            if risk > 0 and rew/risk >= MIN_RR:
-                return {"side":"LONG","sl":round(slp,2),"tp":round(tpp,2),
-                        "why":f"{trend} | floor {ns['mid']:.2f} ({ns['touches']}x) | RR {rew/risk:.1f}"}
+    # LONG: not in a bearish (last BOS down) tape, bullish candle, at a floor
+    if trend != "BEAR" and sig == "bull" and nearest_sup and nearest_res:
+        if (price - nearest_sup["mid"]) < 2.5 * noise:
+            slp = nearest_sup["mid"] - max(2.0 * noise, price * 0.0005)
+            tpp = nearest_res["mid"] - 0.5 * noise
+            risk, reward = price - slp, tpp - price
+            if risk > 0 and reward / risk >= MIN_RR:
+                return {
+                    "side": "LONG", "sl": round(slp, 2), "tp": round(tpp, 2),
+                    "why": (f"{trend} | floor {nearest_sup['mid']:.2f} "
+                            f"({nearest_sup['touches']}x) | RR {reward/risk:.1f}"),
+                }
 
-    if trend != "BULL" and sig == "bear" and nr and ns:
-        if (nr["mid"] - price) < 2.5 * noise:                        # near ceiling
-            slp = nr["mid"] + max(1.5*noise, price*0.0005)
-            tpp = ns["mid"] + 0.5*noise
-            risk, rew = slp - price, price - tpp
-            if risk > 0 and rew/risk >= MIN_RR:
-                return {"side":"SHORT","sl":round(slp,2),"tp":round(tpp,2),
-                        "why":f"{trend} | ceiling {nr['mid']:.2f} ({nr['touches']}x) | RR {rew/risk:.1f}"}
+    # SHORT: not in a bullish (last BOS up) tape, bearish candle, at a ceiling
+    if trend != "BULL" and sig == "bear" and nearest_res and nearest_sup:
+        if (nearest_res["mid"] - price) < 2.5 * noise:
+            slp = nearest_res["mid"] + max(2.0 * noise, price * 0.0005)
+            tpp = nearest_sup["mid"] + 0.5 * noise
+            risk, reward = slp - price, price - tpp
+            if risk > 0 and reward / risk >= MIN_RR:
+                return {
+                    "side": "SHORT", "sl": round(slp, 2), "tp": round(tpp, 2),
+                    "why": (f"{trend} | ceiling {nearest_res['mid']:.2f} "
+                            f"({nearest_res['touches']}x) | RR {reward/risk:.1f}"),
+                }
     return None
 
-# ---------------- EXECUTION ENGINE ----------------
+# ==========================================
+# 7. TIME ADVANCE + AUTO EXECUTION
+# ==========================================
 def advance(steps):
     for _ in range(steps):
         if st.session_state.step >= len(st.session_state.df) - 1:
-            st.toast("Market closed!", icon="🔔"); break
+            st.toast("Session closed.", icon="🔔")
+            break
         st.session_state.step += 1
         i = st.session_state.step
         df = st.session_state.df
-        c = df.iloc[i]; t = c["label"]
+        c = df.iloc[i]
+        t = c["label"]
 
-        # manage open position
+        # --- manage open position ---
         if st.session_state.shares != 0:
-            sh = st.session_state.shares
-            sl, tp = st.session_state.sl, st.session_state.tp
-            if sh > 0:
+            sh, sl, tp = st.session_state.shares, st.session_state.sl, st.session_state.tp
+            if sh > 0:  # long
                 if c["low"] <= sl:
-                    px = min(sl, c["open"])
-                    st.session_state.balance += sh*px
+                    px = min(sl, float(c["open"]))
+                    st.session_state.balance += sh * px
                     st.session_state.log.append(f"{t}: 🛑 LONG stopped ${px:.2f}")
                     st.session_state.markers.append((t, px, "SL"))
-                    st.session_state.shares = 0; st.session_state.cooldown = COOLDOWN_BARS
+                    st.session_state.shares = 0
+                    st.session_state.cooldown = COOLDOWN_BARS
                 elif c["high"] >= tp:
-                    px = max(tp, c["open"])
-                    st.session_state.balance += sh*px
+                    px = max(tp, float(c["open"]))
+                    st.session_state.balance += sh * px
                     st.session_state.log.append(f"{t}: 🎯 LONG target ${px:.2f}")
                     st.session_state.markers.append((t, px, "TP"))
                     st.session_state.shares = 0
-            else:
+            else:       # short
                 sh = abs(sh)
                 if c["high"] >= sl:
-                    px = max(sl, c["open"])
-                    st.session_state.balance -= sh*px
+                    px = max(sl, float(c["open"]))
+                    st.session_state.balance -= sh * px
                     st.session_state.log.append(f"{t}: 🛑 SHORT stopped ${px:.2f}")
                     st.session_state.markers.append((t, px, "SL"))
-                    st.session_state.shares = 0; st.session_state.cooldown = COOLDOWN_BARS
+                    st.session_state.shares = 0
+                    st.session_state.cooldown = COOLDOWN_BARS
                 elif c["low"] <= tp:
-                    px = min(tp, c["open"])
-                    st.session_state.balance -= sh*px
+                    px = min(tp, float(c["open"]))
+                    st.session_state.balance -= sh * px
                     st.session_state.log.append(f"{t}: 🎯 SHORT covered ${px:.2f}")
                     st.session_state.markers.append((t, px, "TP"))
                     st.session_state.shares = 0
             if st.session_state.shares == 0:
                 st.session_state.sl = st.session_state.tp = st.session_state.entry = None
                 st.session_state.side = None
-            continue
+            continue  # never flip the same bar as an exit
 
         if st.session_state.cooldown > 0:
-            st.session_state.cooldown -= 1; continue
-        if i < st.session_state.start_idx:
+            st.session_state.cooldown -= 1
             continue
 
-        visible = df.iloc[:i+1]        # includes past days = bot's context
-        labeled, _ = detect_structure(visible)
-        zones = build_zones(labeled, visible["close"].iloc[-1])
-        d = bot_decide(visible, i, labeled, zones)
-        if d:
-            px = c["close"]; sh = TRADE_AMT/px
-            if d["side"] == "LONG":
-                st.session_state.balance -= TRADE_AMT; st.session_state.shares = sh
-            else:
-                st.session_state.balance += TRADE_AMT; st.session_state.shares = -sh
-            st.session_state.entry, st.session_state.sl = px, d["sl"]
-            st.session_state.tp, st.session_state.side = d["tp"], d["side"]
-            st.session_state.log.append(
-                f"{t}: 🤖 {d['side']} at ${px:.2f} (SL {d['sl']} / TP {d['tp']}) — {d['why']}")
-            st.session_state.markers.append((t, px, d["side"]))
+        if i < WARMUP_BARS:
+            continue
 
-# ---------------- UI ----------------
-st.title("🤖 Auto-Trader Bot v2")
+        visible = df.iloc[: i + 1]
+        labeled, bos = detect_structure(visible)
+        zones = build_zones(labeled, float(visible["close"].iloc[-1]))
+        decision = bot_decide(visible, i, labeled, bos, zones)
+        if decision:
+            px = float(c["close"])
+            sh = TRADE_AMT / px
+            if decision["side"] == "LONG":
+                st.session_state.balance -= TRADE_AMT
+                st.session_state.shares = sh
+            else:
+                st.session_state.balance += TRADE_AMT
+                st.session_state.shares = -sh
+            st.session_state.entry = px
+            st.session_state.sl = decision["sl"]
+            st.session_state.tp = decision["tp"]
+            st.session_state.side = decision["side"]
+            st.session_state.log.append(
+                f"{t}: 🤖 {decision['side']} ${TRADE_AMT:.0f} at ${px:.2f} "
+                f"(SL {decision['sl']} / TP {decision['tp']}) — {decision['why']}"
+            )
+            st.session_state.markers.append((t, px, decision["side"]))
+
+# ==========================================
+# 8. UI
+# ==========================================
+st.title("🤖 Auto-Trader Bot — Trial v2 (current day only)")
+st.caption("Swings, BOS, S/R and trades are computed from **today’s RTH bars only**. "
+           "No overnight levels, no last-week 713 ghosts.")
+
 st.sidebar.header("Setup")
 ticker = st.sidebar.text_input("Ticker", "QQQ").upper()
 day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
+show_struct = st.sidebar.checkbox("Show structure labels", True)
+show_zones = st.sidebar.checkbox("Show S/R zones", True)
 
-raw = fetch(ticker, day)
-if raw is not None and day in raw["date_only"].values:
-    mask = raw["date_only"] == day
+raw = fetch_session(ticker, day)
+if raw is None or raw.empty:
+    st.sidebar.error("No 1-minute RTH data for that date (yfinance 1m only keeps ~7 days).")
+else:
+    st.sidebar.success(f"{len(raw)} bars  {raw['label'].iloc[0]} → {raw['label'].iloc[-1]}")
     if st.sidebar.button("🚀 Start / Reset"):
-        st.session_state.update({k: v for k, v in defaults.items()
-                                 if k not in ("df","start_idx","step")})
+        for k, v in defaults.items():
+            st.session_state[k] = v
         st.session_state.df = raw
-        st.session_state.start_idx = raw.index[mask][0]
-        st.session_state.step = raw.index[mask][0] + 15
+        st.session_state.start_idx = 0
+        st.session_state.step = min(WARMUP_BARS, len(raw) - 2)
         st.session_state.active = True
         st.rerun()
-else:
-    st.sidebar.error("No 1m data for that date.")
 
-show_struct = st.sidebar.checkbox("Structure labels", True)
-show_zones = st.sidebar.checkbox("S/R zones", True)
-
-if st.session_state.active:
+if st.session_state.active and len(st.session_state.df) > 0:
     i = st.session_state.step
     df = st.session_state.df
-    full_vis = df.iloc[:i+1]                                  # bot's full context
-    day_vis = full_vis.iloc[st.session_state.start_idx - full_vis.index[0]:] \
-              if False else full_vis[full_vis.index >= st.session_state.start_idx]  # chart = today only
-    price = full_vis["close"].iloc[-1]
-
-    labeled, bos = detect_structure(full_vis)
+    vis = df.iloc[: i + 1]
+    price = float(vis["close"].iloc[-1])
+    labeled, bos = detect_structure(vis)
     zones = build_zones(labeled, price)
-    trend = trend_state([s for s in labeled if s["i"] + SWING_K <= i])
+    trend = trend_state(labeled, bos, i)
 
     pos_val = st.session_state.shares * price
     equity = st.session_state.balance + pos_val
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Price", f"${price:.2f}")
-    c2.metric("Equity", f"${equity:.2f}", f"${equity-1000:.2f}")
-    c3.metric("Position", st.session_state.side or "FLAT",
-              f"SL {st.session_state.sl} / TP {st.session_state.tp}" if st.session_state.side else "")
-    c4.metric("Bot Trend Read", trend)
+    c2.metric("Equity", f"${equity:.2f}", f"${equity - 1000:.2f}")
+    c3.metric(
+        "Position",
+        st.session_state.side or "FLAT",
+        f"SL {st.session_state.sl} / TP {st.session_state.tp}" if st.session_state.side else "",
+    )
+    c4.metric("Bot trend (last session BOS)", trend)
 
-    # ---- CHART: current day only, white theme ----
     fig = go.Figure([go.Candlestick(
-        x=day_vis["label"], open=day_vis["open"], high=day_vis["high"],
-        low=day_vis["low"], close=day_vis["close"],
-        increasing_line_color="#089981", decreasing_line_color="#e02f2f")])
-
-    day_first_idx = day_vis.index[0]
+        x=vis["label"], open=vis["open"], high=vis["high"],
+        low=vis["low"], close=vis["close"], name="price",
+    )])
 
     if show_struct:
         for s in labeled:
-            if s["i"] + SWING_K > i: continue
-            if s["i"] < day_first_idx: continue               # only label today's swings
-            bullish = s["label"] in ("HH", "HL")
+            if s["i"] + SWING_K > i:
+                continue  # unconfirmed — do not draw
+            up = s["type"] == "L"
+            bullish_lab = s["label"] in ("HH", "HL", "H")
             fig.add_annotation(
-                x=df["label"].iloc[s["i"]], y=s["price"], text=f"<b>{s['label']}</b>",
-                showarrow=False, yshift=-16 if s["type"]=="L" else 16,
-                font=dict(size=12, color="green" if bullish else "red"),
-                bgcolor="white", bordercolor="black", borderwidth=1)
+                x=vis["label"].iloc[s["i"]], y=s["price"],
+                text=s["label"], showarrow=False,
+                yshift=-16 if up else 16,
+                font=dict(size=11, color="lime" if bullish_lab else "red"),
+                bgcolor="rgba(0,0,0,0.45)",
+            )
         for b in bos:
-            if b["i"] < day_first_idx: continue
             fig.add_annotation(
-                x=df["label"].iloc[b["i"]], y=b["price"],
-                text=f"<b>BOS{'↑' if b['dir']=='up' else '↓'}</b>",
-                showarrow=True, arrowhead=2, arrowcolor="black",
-                font=dict(size=12, color="black"), bgcolor="yellow")
+                x=vis["label"].iloc[b["i"]], y=b["price"],
+                text="BOS↑" if b["dir"] == "up" else "BOS↓",
+                showarrow=True, arrowhead=2,
+                font=dict(size=11, color="#111"),
+                bgcolor="yellow",
+            )
 
     if show_zones:
-        # only nearest 3 each side = clean chart
-        sup = sorted([z for z in zones if z["mid"] < price],
-                     key=lambda z: -z["mid"])[:MAX_ZONES_SHOWN]
-        res = sorted([z for z in zones if z["mid"] > price],
-                     key=lambda z: z["mid"])[:MAX_ZONES_SHOWN]
-        for z in sup:
-            fig.add_hline(y=z["mid"], line=dict(color="green", width=1.5, dash="dot"),
-                          annotation_text=f"S {z['mid']:.2f} ({z['touches']}x)",
-                          annotation_font_color="green")
-        for z in res:
-            fig.add_hline(y=z["mid"], line=dict(color="red", width=1.5, dash="dot"),
-                          annotation_text=f"R {z['mid']:.2f} ({z['touches']}x)",
-                          annotation_font_color="red")
+        last_x = vis["label"].iloc[-1]
+        for z in zones:
+            col = "lime" if z["mid"] < price else "red"
+            fig.add_hline(
+                y=z["mid"],
+                line=dict(color=col, width=min(z["touches"], 3), dash="dot"),
+            )
+            fig.add_annotation(
+                x=last_x, y=z["mid"], xanchor="left",
+                text=f" {z['mid']:.2f} ({z['touches']}x)",
+                showarrow=False,
+                font=dict(size=10, color=col),
+            )
 
     if st.session_state.side:
-        fig.add_hline(y=st.session_state.sl, line=dict(color="orange", width=2, dash="dash"),
-                      annotation_text="STOP", annotation_font_color="orange")
-        fig.add_hline(y=st.session_state.tp, line=dict(color="blue", width=2, dash="dash"),
-                      annotation_text="TARGET", annotation_font_color="blue")
+        fig.add_hline(y=st.session_state.sl, line=dict(color="orange", dash="dash"))
+        fig.add_hline(y=st.session_state.tp, line=dict(color="cyan", dash="dash"))
 
-    day_labels = set(day_vis["label"])
     for t, p, kind in st.session_state.markers:
-        if t not in day_labels: continue
-        sym = {"LONG":"triangle-up","SHORT":"triangle-down","TP":"star","SL":"x"}[kind]
-        col = {"LONG":"green","SHORT":"red","TP":"blue","SL":"orange"}[kind]
-        fig.add_trace(go.Scatter(x=[t], y=[p], mode="markers", showlegend=False,
-                                 marker=dict(symbol=sym, size=14, color=col,
-                                             line=dict(width=1, color="black"))))
+        sym = {"LONG": "triangle-up", "SHORT": "triangle-down", "TP": "star", "SL": "x"}[kind]
+        col = {"LONG": "lime", "SHORT": "red", "TP": "cyan", "SL": "orange"}[kind]
+        fig.add_trace(go.Scatter(
+            x=[t], y=[p], mode="markers", showlegend=False,
+            marker=dict(symbol=sym, size=12, color=col),
+        ))
 
-    fig.update_layout(template="plotly_white", height=620, dragmode="pan",
-                      xaxis_rangeslider_visible=False,
-                      title=f"{ticker} {day} | {day_vis['label'].iloc[-1]} | Trend: {trend}")
-    fig.update_xaxes(type="category", nticks=10)
+    fig.update_layout(
+        template="plotly_dark", height=640, dragmode="pan",
+        xaxis_rangeslider_visible=False,
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | session-only | trend {trend}",
+    )
+    fig.update_xaxes(type="category", nticks=12)
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
-    a1, a2, a3, _ = st.columns([1,1,1,3])
-    if a1.button("▶️ +1 Min"):  advance(1);  st.rerun()
-    if a2.button("⏩ +5 Min"):  advance(5);  st.rerun()
-    if a3.button("⏭️ +15 Min"): advance(15); st.rerun()
+    a1, a2, a3, _ = st.columns([1, 1, 1, 3])
+    if a1.button("▶️ +1 Min"):
+        advance(1); st.rerun()
+    if a2.button("⏩ +5 Min"):
+        advance(5); st.rerun()
+    if a3.button("⏭️ +15 Min"):
+        advance(15); st.rerun()
 
     if st.session_state.log:
         with st.expander("📝 Bot Decision Log", expanded=True):
-            for l in reversed(st.session_state.log): st.text(l)
+            for line in reversed(st.session_state.log):
+                st.text(line)
 else:
-    st.info("👈 Pick date → Start. Then click time buttons and watch the bot trade.")
+    st.info("Pick a **recent** date (1m data is only ~7 days on Yahoo) and press Start. "
+            "Then step +1 / +5 / +15 and grade the labels first — trades second.")
