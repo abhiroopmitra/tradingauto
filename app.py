@@ -1,6 +1,7 @@
 # ============================================================
-#  BOT TRIAL APP v7
-#  Structural stops + one-bite-per-shelf (reset only on new BOS).
+#  BOT TRIAL APP v8
+#  BOS/CHoCH only poisons a zone that was ALREADY 3+ touches.
+#  Early drive seeds the floor/ceiling; it does not blacklist it.
 #  Same rules every session. No date-specific logic.
 # ============================================================
 import streamlit as st
@@ -10,7 +11,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v7")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v8")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -28,7 +29,7 @@ NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
 STRUCT_TOUCHES = 3
 POLARITY_EDGE = 2
-SWING_STOP_NEAR = 0.0025   # last LL/HH within 0.25% of the zone counts as the structure stop
+SWING_STOP_NEAR = 0.0025
 
 C_HH = dict(fg="#ffffff", bg="#166534")
 C_LH = dict(fg="#ffffff", bg="#991b1b")
@@ -46,8 +47,8 @@ defaults = {
     "entry": None, "sl": None, "tp": None, "side": None,
     "step": 0, "df": pd.DataFrame(), "log": [], "start_idx": 0,
     "cooldown": 0, "markers": [],
-    "spent": [],          # [{"mid": float, "side": "LONG"/"SHORT", "bos_n": int}]
-    "zone_mid": None,     # shelf used by the open trade
+    "spent": [],
+    "zone_mid": None,
     "bos_n": 0,
 }
 for k, v in defaults.items():
@@ -257,15 +258,29 @@ def zone_broken_by_close(z, close, noise):
         return "down"
     return None
 
-def event_through_zone(z, bos, choch, i, noise):
+def zone_touches_at(labeled, ref_price, mid, at_i):
+    """Touches the zone had from swings CONFIRMED before/at at_i (no lookahead)."""
+    conf = [s for s in labeled if s["i"] + SWING_K <= at_i]
+    zones = build_zones(conf, ref_price)
+    for z in zones:
+        if abs(z["mid"] - mid) / max(ref_price, 1e-9) < ZONE_TOL * 2:
+            return z["touches"]
+    return 0
+
+def event_through_zone(z, bos, choch, i, noise, labeled, ref_price):
+    """Poison only if BOS/CHoCH hit a zone that was already 3+ touches."""
     buf = max(noise, z["mid"] * 0.0004)
     lo, hi = z["min_px"] - buf, z["max_px"] + buf
     for b in bos:
         if b["i"] <= i and lo <= b["price"] <= hi:
-            return b["dir"]
+            prior = max(0, b["i"] - 1)
+            if zone_touches_at(labeled, ref_price, z["mid"], prior) >= MIN_TRADE_TOUCHES:
+                return b["dir"]
     for h in choch:
         if h["i"] <= i and lo <= h["price"] <= hi:
-            return h["dir"]
+            prior = max(0, h["i"] - 1)
+            if zone_touches_at(labeled, ref_price, z["mid"], prior) >= MIN_TRADE_TOUCHES:
+                return h["dir"]
     return None
 
 def classify_zones(zones, price, noise):
@@ -303,7 +318,6 @@ def nearest_above(zs, price, min_touches=MIN_DRAW_TOUCHES):
     return min(above, key=lambda z: z["mid"]) if above else None
 
 def structural_long_stop(z, labeled, i, price, noise):
-    """Beyond the last L-swing that tagged this floor — not the zone mid."""
     conf = [s for s in labeled if s["i"] + SWING_K <= i and s["type"] == "L"]
     near = max(price * SWING_STOP_NEAR, 3 * noise)
     tagged = [s["price"] for s in conf if abs(s["price"] - z["mid"]) <= near]
@@ -394,7 +408,7 @@ def bot_decide(df, i, labeled, bos, choch, zones):
     if sig == "bull" and floor_here is not None and ceil_here is None:
         if shelf_spent(floor_here["mid"], "LONG", price):
             return None
-        thru = event_through_zone(floor_here, bos, choch, i, noise)
+        thru = event_through_zone(floor_here, bos, choch, i, noise, labeled, price)
         brk = zone_broken_by_close(floor_here, price, noise)
         if thru == "down" or brk == "down":
             return None
@@ -424,7 +438,7 @@ def bot_decide(df, i, labeled, bos, choch, zones):
     if sig == "bear" and ceil_here is not None and floor_here is None:
         if shelf_spent(ceil_here["mid"], "SHORT", price):
             return None
-        thru = event_through_zone(ceil_here, bos, choch, i, noise)
+        thru = event_through_zone(ceil_here, bos, choch, i, noise, labeled, price)
         brk = zone_broken_by_close(ceil_here, price, noise)
         if thru == "up" or brk == "up":
             return None
@@ -561,11 +575,11 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v7")
+st.title("🤖 Auto-Trader Bot — Trial v8")
 st.caption(
-    "Same rules every session. **Stop** = last swing that tagged the shelf, not the zone mid. "
-    "**One bite per shelf** after a TP until a **new BOS**. Polarity still needs a 2-touch edge. "
-    "No fade after CHoCH/BOS through the zone."
+    "Same rules every session. **BOS/CHoCH only invalidates a zone that already had 3+ touches.** "
+    "An opening drive that *creates* the floor does not blacklist later tests. "
+    "Current close through the zone still blocks. Structural stop, one-bite after TP, polarity +2."
 )
 
 st.sidebar.header("Setup")
@@ -574,7 +588,7 @@ day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 st.sidebar.markdown(
-    f"structural stop · one-bite until BOS · `POLARITY_EDGE={POLARITY_EDGE}`"
+    "poison only if zone was **already 3+** · structural stop · one-bite until BOS"
 )
 
 raw = fetch_session(ticker, day)
@@ -686,7 +700,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         template="plotly_white", height=660, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v7 session-only | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v8 session-only | {trend}",
         margin=dict(r=160),
     )
     fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb", linecolor="#111111")
@@ -706,4 +720,4 @@ if st.session_state.active and len(st.session_state.df) > 0:
             for line in reversed(st.session_state.log):
                 st.text(line)
 else:
-    st.info("Pick any recent date and press Start. Grade **stop location** and **no second bite** — not PnL.")
+    st.info("Pick any recent date and press Start. Grade whether the **open-drive BOS still allows later floor longs**.")
