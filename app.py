@@ -570,7 +570,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
     )
     c4.metric("Trend (last BOS / CHoCH)", trend)
 
-        fig = go.Figure([go.Candlestick(
+    fig = go.Figure([go.Candlestick(
         x=vis["label"],
         open=vis["open"],
         high=vis["high"],
