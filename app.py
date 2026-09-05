@@ -1,7 +1,6 @@
 # ============================================================
-#  BOT TRIAL APP v8
-#  BOS/CHoCH only poisons a zone that was ALREADY 3+ touches.
-#  Early drive seeds the floor/ceiling; it does not blacklist it.
+#  BOT TRIAL APP v9
+#  Strong-shelf hold trigger (5+ touches) + poison only on CLOSE through.
 #  Same rules every session. No date-specific logic.
 # ============================================================
 import streamlit as st
@@ -11,7 +10,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v8")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v9")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -24,6 +23,7 @@ BOS_FLAT_COOLDOWN = 5
 MIN_SWING_PCT = 0.0008
 WARMUP_BARS = 30
 STRONG_ZONE = 3
+HOLD_TOUCHES = 5            # 5+ L/H: tag + close back in is a valid trigger
 STOP_NOISE_MULT = 1.5
 NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
@@ -47,9 +47,7 @@ defaults = {
     "entry": None, "sl": None, "tp": None, "side": None,
     "step": 0, "df": pd.DataFrame(), "log": [], "start_idx": 0,
     "cooldown": 0, "markers": [],
-    "spent": [],
-    "zone_mid": None,
-    "bos_n": 0,
+    "spent": [], "zone_mid": None, "bos_n": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -259,7 +257,6 @@ def zone_broken_by_close(z, close, noise):
     return None
 
 def zone_touches_at(labeled, ref_price, mid, at_i):
-    """Touches the zone had from swings CONFIRMED before/at at_i (no lookahead)."""
     conf = [s for s in labeled if s["i"] + SWING_K <= at_i]
     zones = build_zones(conf, ref_price)
     for z in zones:
@@ -267,8 +264,8 @@ def zone_touches_at(labeled, ref_price, mid, at_i):
             return z["touches"]
     return 0
 
-def event_through_zone(z, bos, choch, i, noise, labeled, ref_price):
-    """Poison only if BOS/CHoCH hit a zone that was already 3+ touches."""
+def event_through_zone(z, bos, i, noise, labeled, ref_price):
+    """BOS only (not CHoCH). Counts only if zone was already 3+ before the BOS."""
     buf = max(noise, z["mid"] * 0.0004)
     lo, hi = z["min_px"] - buf, z["max_px"] + buf
     for b in bos:
@@ -276,11 +273,6 @@ def event_through_zone(z, bos, choch, i, noise, labeled, ref_price):
             prior = max(0, b["i"] - 1)
             if zone_touches_at(labeled, ref_price, z["mid"], prior) >= MIN_TRADE_TOUCHES:
                 return b["dir"]
-    for h in choch:
-        if h["i"] <= i and lo <= h["price"] <= hi:
-            prior = max(0, h["i"] - 1)
-            if zone_touches_at(labeled, ref_price, z["mid"], prior) >= MIN_TRADE_TOUCHES:
-                return h["dir"]
     return None
 
 def classify_zones(zones, price, noise):
@@ -375,15 +367,42 @@ def candle_signal(df, i):
             return "bear"
     return None
 
+def hold_rejection(df, i, z, side, noise):
+    """5+ touch shelf: wick tags the zone, close back on the right side."""
+    lo = float(df["low"].iloc[i])
+    hi = float(df["high"].iloc[i])
+    c = float(df["close"].iloc[i])
+    pad = max(noise * 0.5, z["mid"] * 0.0003)
+    if side == "bull":
+        tagged = lo <= z["max_px"] + pad
+        back = c >= z["min_px"] - pad * 0.25 and c >= min(z["mid"], (z["min_px"] + z["max_px"]) / 2)
+        return tagged and back
+    tagged = hi >= z["min_px"] - pad
+    back = c <= z["max_px"] + pad * 0.25 and c <= max(z["mid"], (z["min_px"] + z["max_px"]) / 2)
+    return tagged and back
+
+def long_trigger(df, i, floor_here, noise):
+    sig = candle_signal(df, i)
+    if sig == "bull":
+        return "candle"
+    if floor_here["low_touches"] >= HOLD_TOUCHES and hold_rejection(df, i, floor_here, "bull", noise):
+        return "hold"
+    return None
+
+def short_trigger(df, i, ceil_here, noise):
+    sig = candle_signal(df, i)
+    if sig == "bear":
+        return "candle"
+    if ceil_here["high_touches"] >= HOLD_TOUCHES and hold_rejection(df, i, ceil_here, "bear", noise):
+        return "hold"
+    return None
+
 def bot_decide(df, i, labeled, bos, choch, zones):
     price = float(df["close"].iloc[i])
     noise = float((df["high"] - df["low"]).iloc[max(0, i - 20): i + 1].mean())
     if not noise or noise <= 0:
         return None
     trend = trend_state(bos, choch, i, labeled)
-    sig = candle_signal(df, i)
-    if sig is None:
-        return None
 
     floors, ceilings, boths = classify_zones(zones, price, noise)
     near = NEAR_ZONE_MULT * noise
@@ -405,65 +424,71 @@ def bot_decide(df, i, labeled, bos, choch, zones):
         else:
             return None
 
-    if sig == "bull" and floor_here is not None and ceil_here is None:
-        if shelf_spent(floor_here["mid"], "LONG", price):
-            return None
-        thru = event_through_zone(floor_here, bos, choch, i, noise, labeled, price)
-        brk = zone_broken_by_close(floor_here, price, noise)
-        if thru == "down" or brk == "down":
-            return None
-        if floor_here["low_touches"] < floor_here["high_touches"] + POLARITY_EDGE:
-            return None
-        strong_bottom = floor_here["low_touches"] >= STRONG_ZONE
-        allow = (trend != "BEAR") or strong_bottom
-        if allow:
-            target_pool = ceilings + boths
-            target = nearest_above(target_pool, price, MIN_DRAW_TOUCHES)
-            if target is not None:
-                slp = structural_long_stop(floor_here, labeled, i, price, noise)
-                tpp = target["mid"] - 0.4 * noise
-                if slp >= price:
-                    return None
-                risk, reward = price - slp, tpp - price
-                if risk > 0 and reward / risk >= MIN_RR:
-                    tag = "double-bottom override" if trend == "BEAR" else trend
-                    return {
-                        "side": "LONG", "sl": round(slp, 2), "tp": round(tpp, 2),
-                        "zone_mid": floor_here["mid"],
-                        "why": (f"{tag} | FLOOR {floor_here['mid']:.2f} "
-                                f"({floor_here['low_touches']}L/{floor_here['touches']}x) "
-                                f"| RR {reward/risk:.1f}"),
-                    }
+    if floor_here is not None and ceil_here is None:
+        trig = long_trigger(df, i, floor_here, noise)
+        if trig:
+            if shelf_spent(floor_here["mid"], "LONG", price):
+                return None
+            thru = event_through_zone(floor_here, bos, i, noise, labeled, price)
+            brk = zone_broken_by_close(floor_here, price, noise)
+            if thru == "down" or brk == "down":
+                return None
+            if floor_here["low_touches"] < floor_here["high_touches"] + POLARITY_EDGE:
+                return None
+            strong_bottom = floor_here["low_touches"] >= STRONG_ZONE
+            allow = (trend != "BEAR") or strong_bottom
+            if allow:
+                target_pool = ceilings + boths
+                target = nearest_above(target_pool, price, MIN_DRAW_TOUCHES)
+                if target is not None:
+                    slp = structural_long_stop(floor_here, labeled, i, price, noise)
+                    tpp = target["mid"] - 0.4 * noise
+                    if slp >= price:
+                        return None
+                    risk, reward = price - slp, tpp - price
+                    if risk > 0 and reward / risk >= MIN_RR:
+                        tag = "double-bottom override" if trend == "BEAR" else trend
+                        how = "hold-reject" if trig == "hold" else tag
+                        return {
+                            "side": "LONG", "sl": round(slp, 2), "tp": round(tpp, 2),
+                            "zone_mid": floor_here["mid"],
+                            "why": (f"{how} | FLOOR {floor_here['mid']:.2f} "
+                                    f"({floor_here['low_touches']}L/{floor_here['touches']}x) "
+                                    f"| RR {reward/risk:.1f}"),
+                        }
 
-    if sig == "bear" and ceil_here is not None and floor_here is None:
-        if shelf_spent(ceil_here["mid"], "SHORT", price):
-            return None
-        thru = event_through_zone(ceil_here, bos, choch, i, noise, labeled, price)
-        brk = zone_broken_by_close(ceil_here, price, noise)
-        if thru == "up" or brk == "up":
-            return None
-        if ceil_here["high_touches"] < ceil_here["low_touches"] + POLARITY_EDGE:
-            return None
-        strong_top = ceil_here["high_touches"] >= STRONG_ZONE
-        allow = (trend != "BULL") or strong_top
-        if allow:
-            target_pool = floors + boths
-            target = nearest_below(target_pool, price, MIN_DRAW_TOUCHES)
-            if target is not None:
-                slp = structural_short_stop(ceil_here, labeled, i, price, noise)
-                tpp = target["mid"] + 0.4 * noise
-                if slp <= price:
-                    return None
-                risk, reward = slp - price, price - tpp
-                if risk > 0 and reward / risk >= MIN_RR:
-                    tag = "double-top override" if trend == "BULL" else trend
-                    return {
-                        "side": "SHORT", "sl": round(slp, 2), "tp": round(tpp, 2),
-                        "zone_mid": ceil_here["mid"],
-                        "why": (f"{tag} | CEILING {ceil_here['mid']:.2f} "
-                                f"({ceil_here['high_touches']}H/{ceil_here['touches']}x) "
-                                f"| RR {reward/risk:.1f}"),
-                    }
+    if ceil_here is not None and floor_here is None:
+        trig = short_trigger(df, i, ceil_here, noise)
+        if trig:
+            if shelf_spent(ceil_here["mid"], "SHORT", price):
+                return None
+            thru = event_through_zone(ceil_here, bos, i, noise, labeled, price)
+            brk = zone_broken_by_close(ceil_here, price, noise)
+            if thru == "up" or brk == "up":
+                return None
+            if ceil_here["high_touches"] < ceil_here["low_touches"] + POLARITY_EDGE:
+                return None
+            strong_top = ceil_here["high_touches"] >= STRONG_ZONE
+            allow = (trend != "BULL") or strong_top
+            if allow:
+                target_pool = floors + boths
+                target = nearest_below(target_pool, price, MIN_DRAW_TOUCHES)
+                if target is not None:
+                    slp = structural_short_stop(ceil_here, labeled, i, price, noise)
+                    tpp = target["mid"] + 0.4 * noise
+                    if slp <= price:
+                        return None
+                    risk, reward = slp - price, price - tpp
+                    if risk > 0 and reward / risk >= MIN_RR:
+                        tag = "double-top override" if trend == "BULL" else trend
+                        how = "hold-reject" if trig == "hold" else tag
+                        return {
+                            "side": "SHORT", "sl": round(slp, 2), "tp": round(tpp, 2),
+                            "zone_mid": ceil_here["mid"],
+                            "why": (f"{how} | CEILING {ceil_here['mid']:.2f} "
+                                    f"({ceil_here['high_touches']}H/{ceil_here['touches']}x) "
+                                    f"| RR {reward/risk:.1f}"),
+                        }
     return None
 
 def _close_long(px, t, kind, reason=""):
@@ -575,11 +600,11 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v8")
+st.title("🤖 Auto-Trader Bot — Trial v9")
 st.caption(
-    "Same rules every session. **BOS/CHoCH only invalidates a zone that already had 3+ touches.** "
-    "An opening drive that *creates* the floor does not blacklist later tests. "
-    "Current close through the zone still blocks. Structural stop, one-bite after TP, polarity +2."
+    "Same rules every session. **5+ touch shelf:** tag + close back in is a valid trigger "
+    "(no engulf required). **Poison = close through**, not a CHoCH overlap. "
+    "BOS through a zone still only counts if it was already 3+. Structural stop, one-bite, polarity +2."
 )
 
 st.sidebar.header("Setup")
@@ -588,7 +613,7 @@ day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 st.sidebar.markdown(
-    "poison only if zone was **already 3+** · structural stop · one-bite until BOS"
+    f"hold-reject at **{HOLD_TOUCHES}+** · poison = **close through** · polarity +{POLARITY_EDGE}"
 )
 
 raw = fetch_session(ticker, day)
@@ -700,7 +725,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         template="plotly_white", height=660, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v8 session-only | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v9 session-only | {trend}",
         margin=dict(r=160),
     )
     fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb", linecolor="#111111")
@@ -720,4 +745,4 @@ if st.session_state.active and len(st.session_state.df) > 0:
             for line in reversed(st.session_state.log):
                 st.text(line)
 else:
-    st.info("Pick any recent date and press Start. Grade whether the **open-drive BOS still allows later floor longs**.")
+    st.info("Pick any recent date and press Start. Grade the **14:40-style hold of a 5+ floor** — not PnL.")
