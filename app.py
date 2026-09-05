@@ -1,7 +1,7 @@
 # ============================================================
-#  BOT TRIAL APP v9
-#  Strong-shelf hold trigger (5+ touches) + poison only on CLOSE through.
-#  Same rules every session. No date-specific logic.
+#  BOT TRIAL APP v10
+#  Closer/stronger shelf wins; wick tags zone; stop stays in-band;
+#  broken = close beyond extreme. Same rules every session.
 # ============================================================
 import streamlit as st
 import plotly.graph_objects as go
@@ -10,7 +10,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v9")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v10")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -18,18 +18,18 @@ ZONE_TOL = 0.0012
 MIN_DRAW_TOUCHES = 2
 MIN_TRADE_TOUCHES = 3
 MIN_RR = 1.2
+MIN_RR_STRONG = 1.0       # 5+ shelf may take 1.0 RR (structural stop is honest)
 COOLDOWN_BARS = 15
 BOS_FLAT_COOLDOWN = 5
 MIN_SWING_PCT = 0.0008
 WARMUP_BARS = 30
 STRONG_ZONE = 3
-HOLD_TOUCHES = 5            # 5+ L/H: tag + close back in is a valid trigger
+HOLD_TOUCHES = 5
 STOP_NOISE_MULT = 1.5
 NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
 STRUCT_TOUCHES = 3
 POLARITY_EDGE = 2
-SWING_STOP_NEAR = 0.0025
 
 C_HH = dict(fg="#ffffff", bg="#166534")
 C_LH = dict(fg="#ffffff", bg="#991b1b")
@@ -241,18 +241,16 @@ def zone_role(z, close, noise):
         role = "ceiling"
     else:
         role = "both"
-    buffer = max(noise, z["mid"] * 0.0004)
-    if role == "floor" and close < z["mid"] - buffer:
+    if role == "floor" and close < z["min_px"] - noise:
         return "broken_floor"
-    if role == "ceiling" and close > z["mid"] + buffer:
+    if role == "ceiling" and close > z["max_px"] + noise:
         return "broken_ceiling"
     return role
 
 def zone_broken_by_close(z, close, noise):
-    buffer = max(noise, z["mid"] * 0.0004)
-    if close > z["max_px"] + buffer:
+    if close > z["max_px"] + noise:
         return "up"
-    if close < z["min_px"] - buffer:
+    if close < z["min_px"] - noise:
         return "down"
     return None
 
@@ -265,9 +263,7 @@ def zone_touches_at(labeled, ref_price, mid, at_i):
     return 0
 
 def event_through_zone(z, bos, i, noise, labeled, ref_price):
-    """BOS only (not CHoCH). Counts only if zone was already 3+ before the BOS."""
-    buf = max(noise, z["mid"] * 0.0004)
-    lo, hi = z["min_px"] - buf, z["max_px"] + buf
+    lo, hi = z["min_px"] - noise, z["max_px"] + noise
     for b in bos:
         if b["i"] <= i and lo <= b["price"] <= hi:
             prior = max(0, b["i"] - 1)
@@ -293,12 +289,16 @@ def classify_zones(zones, price, noise):
             floors.append(z)
     return floors, ceilings, boths
 
-def pick_near(zones, price, near, min_touches):
+def bar_overlaps_zone(z, lo, hi, near):
+    return lo <= z["max_px"] + near and hi >= z["min_px"] - near
+
+def pick_touched(zones, lo, hi, close, near, min_touches):
+    """Wick tag counts. Prefer more touches, then closer close."""
     cand = [z for z in zones
-            if z["touches"] >= min_touches and abs(z["mid"] - price) <= near]
+            if z["touches"] >= min_touches and bar_overlaps_zone(z, lo, hi, near)]
     if not cand:
         return None
-    cand.sort(key=lambda z: (-z["touches"], abs(z["mid"] - price)))
+    cand.sort(key=lambda z: (-z["touches"], abs(z["mid"] - close)))
     return cand[0]
 
 def nearest_below(zs, price, min_touches=MIN_DRAW_TOUCHES):
@@ -309,10 +309,13 @@ def nearest_above(zs, price, min_touches=MIN_DRAW_TOUCHES):
     above = [z for z in zs if z["mid"] > price and z["touches"] >= min_touches]
     return min(above, key=lambda z: z["mid"]) if above else None
 
+def _in_band(px, z, noise):
+    pad = max(2.0 * noise, z["max_px"] - z["min_px"])
+    return (z["min_px"] - pad) <= px <= (z["max_px"] + pad)
+
 def structural_long_stop(z, labeled, i, price, noise):
     conf = [s for s in labeled if s["i"] + SWING_K <= i and s["type"] == "L"]
-    near = max(price * SWING_STOP_NEAR, 3 * noise)
-    tagged = [s["price"] for s in conf if abs(s["price"] - z["mid"]) <= near]
+    tagged = [s["price"] for s in conf if _in_band(s["price"], z, noise)]
     structure = min(tagged) if tagged else z["min_px"]
     structure = min(structure, z["min_px"])
     buf = max(STOP_NOISE_MULT * noise, price * 0.0006)
@@ -320,8 +323,7 @@ def structural_long_stop(z, labeled, i, price, noise):
 
 def structural_short_stop(z, labeled, i, price, noise):
     conf = [s for s in labeled if s["i"] + SWING_K <= i and s["type"] == "H"]
-    near = max(price * SWING_STOP_NEAR, 3 * noise)
-    tagged = [s["price"] for s in conf if abs(s["price"] - z["mid"]) <= near]
+    tagged = [s["price"] for s in conf if _in_band(s["price"], z, noise)]
     structure = max(tagged) if tagged else z["max_px"]
     structure = max(structure, z["max_px"])
     buf = max(STOP_NOISE_MULT * noise, price * 0.0006)
@@ -368,17 +370,16 @@ def candle_signal(df, i):
     return None
 
 def hold_rejection(df, i, z, side, noise):
-    """5+ touch shelf: wick tags the zone, close back on the right side."""
     lo = float(df["low"].iloc[i])
     hi = float(df["high"].iloc[i])
     c = float(df["close"].iloc[i])
     pad = max(noise * 0.5, z["mid"] * 0.0003)
     if side == "bull":
         tagged = lo <= z["max_px"] + pad
-        back = c >= z["min_px"] - pad * 0.25 and c >= min(z["mid"], (z["min_px"] + z["max_px"]) / 2)
+        back = c >= z["min_px"] - pad * 0.1
         return tagged and back
     tagged = hi >= z["min_px"] - pad
-    back = c <= z["max_px"] + pad * 0.25 and c <= max(z["mid"], (z["min_px"] + z["max_px"]) / 2)
+    back = c <= z["max_px"] + pad * 0.1
     return tagged and back
 
 def long_trigger(df, i, floor_here, noise):
@@ -397,8 +398,33 @@ def short_trigger(df, i, ceil_here, noise):
         return "hold"
     return None
 
+def resolve_edges(floor_here, ceil_here, lo, hi, close):
+    """If both exist, pick closer or stronger. Skip only if tied."""
+    if floor_here is None or ceil_here is None:
+        return floor_here, ceil_here
+    d_f = abs(close - floor_here["mid"])
+    d_c = abs(close - ceil_here["mid"])
+    if d_f < d_c * 0.6:
+        return floor_here, None
+    if d_c < d_f * 0.6:
+        return None, ceil_here
+    if floor_here["low_touches"] >= ceil_here["high_touches"] + 2:
+        return floor_here, None
+    if ceil_here["high_touches"] >= floor_here["low_touches"] + 2:
+        return None, ceil_here
+    # wick clearly on one shelf
+    f_tag = lo <= floor_here["max_px"] and lo < ceil_here["min_px"]
+    c_tag = hi >= ceil_here["min_px"] and hi > floor_here["max_px"]
+    if f_tag and not c_tag:
+        return floor_here, None
+    if c_tag and not f_tag:
+        return None, ceil_here
+    return None, None
+
 def bot_decide(df, i, labeled, bos, choch, zones):
     price = float(df["close"].iloc[i])
+    lo = float(df["low"].iloc[i])
+    hi = float(df["high"].iloc[i])
     noise = float((df["high"] - df["low"]).iloc[max(0, i - 20): i + 1].mean())
     if not noise or noise <= 0:
         return None
@@ -407,22 +433,15 @@ def bot_decide(df, i, labeled, bos, choch, zones):
     floors, ceilings, boths = classify_zones(zones, price, noise)
     near = NEAR_ZONE_MULT * noise
 
-    both_here = pick_near(boths, price, near, MIN_TRADE_TOUCHES)
+    both_here = pick_touched(boths, lo, hi, price, near, MIN_TRADE_TOUCHES)
     if both_here is not None:
         return None
 
-    floor_here = pick_near(floors, price, near, MIN_TRADE_TOUCHES)
-    ceil_here = pick_near(ceilings, price, near, MIN_TRADE_TOUCHES)
-
-    if floor_here is not None and ceil_here is not None:
-        d_f = abs(price - floor_here["mid"])
-        d_c = abs(price - ceil_here["mid"])
-        if d_f < d_c * 0.6:
-            ceil_here = None
-        elif d_c < d_f * 0.6:
-            floor_here = None
-        else:
-            return None
+    floor_here = pick_touched(floors, lo, hi, price, near, MIN_TRADE_TOUCHES)
+    ceil_here = pick_touched(ceilings, lo, hi, price, near, MIN_TRADE_TOUCHES)
+    floor_here, ceil_here = resolve_edges(floor_here, ceil_here, lo, hi, price)
+    if floor_here is None and ceil_here is None:
+        return None
 
     if floor_here is not None and ceil_here is None:
         trig = long_trigger(df, i, floor_here, noise)
@@ -446,7 +465,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
                     if slp >= price:
                         return None
                     risk, reward = price - slp, tpp - price
-                    if risk > 0 and reward / risk >= MIN_RR:
+                    min_rr = MIN_RR_STRONG if floor_here["low_touches"] >= HOLD_TOUCHES else MIN_RR
+                    if risk > 0 and reward / risk >= min_rr:
                         tag = "double-bottom override" if trend == "BEAR" else trend
                         how = "hold-reject" if trig == "hold" else tag
                         return {
@@ -479,7 +499,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
                     if slp <= price:
                         return None
                     risk, reward = slp - price, price - tpp
-                    if risk > 0 and reward / risk >= MIN_RR:
+                    min_rr = MIN_RR_STRONG if ceil_here["high_touches"] >= HOLD_TOUCHES else MIN_RR
+                    if risk > 0 and reward / risk >= min_rr:
                         tag = "double-top override" if trend == "BULL" else trend
                         how = "hold-reject" if trig == "hold" else tag
                         return {
@@ -600,11 +621,11 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v9")
+st.title("🤖 Auto-Trader Bot — Trial v10")
 st.caption(
-    "Same rules every session. **5+ touch shelf:** tag + close back in is a valid trigger "
-    "(no engulf required). **Poison = close through**, not a CHoCH overlap. "
-    "BOS through a zone still only counts if it was already 3+. Structural stop, one-bite, polarity +2."
+    "Same rules every session. **Closer or stronger shelf wins** (skip only if tied). "
+    "**Wick can tag** the zone. **Stop stays in the zone band** (not the session low). "
+    "**Broken = close beyond the extreme.** 5+ hold-reject, polarity +2, one-bite after TP."
 )
 
 st.sidebar.header("Setup")
@@ -613,7 +634,7 @@ day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 st.sidebar.markdown(
-    f"hold-reject at **{HOLD_TOUCHES}+** · poison = **close through** · polarity +{POLARITY_EDGE}"
+    "closer/stronger edge · wick tag · in-band stop · close-through only"
 )
 
 raw = fetch_session(ticker, day)
@@ -725,7 +746,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         template="plotly_white", height=660, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v9 session-only | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v10 session-only | {trend}",
         margin=dict(r=160),
     )
     fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb", linecolor="#111111")
@@ -745,4 +766,4 @@ if st.session_state.active and len(st.session_state.df) > 0:
             for line in reversed(st.session_state.log):
                 st.text(line)
 else:
-    st.info("Pick any recent date and press Start. Grade the **14:40-style hold of a 5+ floor** — not PnL.")
+    st.info("Pick any recent date and press Start. Grade the **hold of a 5+ floor** and whether SL stayed in-band.")
