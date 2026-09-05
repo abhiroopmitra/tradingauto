@@ -1,17 +1,18 @@
 # ============================================================
-#  BOT TRIAL APP v11
-#  BOS poison = break BEYOND zone extreme (not overlap).
-#  Skip log. Wick tag, closer/stronger shelf, in-band stop.
-#  Same rules every session. No date-specific logic.
+#  BOT TRIAL APP v12
+#  v11 logic + VOLUME: chart panel + volume-confirmation filter.
+#  Volume filter = participation gate + directional conviction.
+#  Toggle in sidebar for A/B testing. Fail-open on bad vol data.
 # ============================================================
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v11")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v12")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -31,6 +32,13 @@ NEAR_ZONE_MULT = 1.2
 CHOCH_ENABLE = True
 STRUCT_TOUCHES = 3
 POLARITY_EDGE = 2
+
+# ---- Volume filter settings ----
+VOL_MA_LEN     = 20      # Volume moving-average lookback
+VOL_MULT       = 1.15    # Trigger candle vol must be >= this × VolMA to confirm
+VOL_STRONG     = 1.8     # >= this × VolMA counts as a "conviction" bar
+VOL_FILTER_ON  = True    # master toggle (also exposed in sidebar)
+VOL_MIN_BARS   = VOL_MA_LEN
 
 C_HH = dict(fg="#ffffff", bg="#166534")
 C_LH = dict(fg="#ffffff", bg="#991b1b")
@@ -76,6 +84,9 @@ def fetch_session(ticker, day):
     df = df[(tod >= 9 * 60 + 30) & (tod < 16 * 60)].copy()
     df["timestamp"] = df["timestamp"].dt.tz_localize(None)
     df = df.dropna(subset=["close"]).drop_duplicates(subset="timestamp")
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    df["volume"] = df["volume"].fillna(0.0)
     df = df[df["timestamp"].dt.date == day].copy()
     df["label"] = df["timestamp"].dt.strftime("%H:%M")
     return df.reset_index(drop=True)
@@ -357,6 +368,63 @@ def note_skip(t, reason):
     s.append(line)
     st.session_state.skips = s[-20:]
 
+# ==========================================
+# VOLUME HELPERS
+# ==========================================
+def volume_context(df, i):
+    """Returns volume stats for bar i vs its trailing MA.
+    Safe against missing/zero volume (fail-open)."""
+    if "volume" not in df.columns:
+        return {"ok": True, "ratio": 1.0, "vma": 0.0, "vol": 0.0, "has_vol": False}
+    vraw = df["volume"].iloc[i]
+    vol = float(vraw) if not pd.isna(vraw) else 0.0
+    lookback = df["volume"].iloc[max(0, i - VOL_MA_LEN): i]  # trailing, excludes current
+    vma = float(lookback.mean()) if len(lookback) else 0.0
+    if vma <= 0:
+        return {"ok": True, "ratio": 1.0, "vma": vma, "vol": vol, "has_vol": False}
+    ratio = vol / vma
+    return {"ok": True, "ratio": ratio, "vma": vma, "vol": vol, "has_vol": True}
+
+def volume_confirms(df, i, side):
+    """The core volume filter.
+    LONG  wants buying pressure: up-candle OR high-vol lower-wick rejection.
+    SHORT wants selling pressure: down-candle OR high-vol upper-wick rejection.
+    Returns (passed: bool, note: str, is_strong: bool)."""
+    if not VOL_FILTER_ON:
+        return True, "vol-filter off", False
+    if i < VOL_MIN_BARS:
+        return True, "vol-warmup", False
+
+    vc = volume_context(df, i)
+    if not vc["has_vol"]:
+        return True, "no-vol-data", False  # fail-open on bad data
+
+    ratio = vc["ratio"]
+    o = float(df["open"].iloc[i]); c = float(df["close"].iloc[i])
+    h = float(df["high"].iloc[i]); l = float(df["low"].iloc[i])
+    body = abs(c - o)
+    up_wick = h - max(o, c)
+    dn_wick = min(o, c) - l
+
+    # 1) Participation gate: the move must have volume behind it
+    if ratio < VOL_MULT:
+        return False, f"vol {ratio:.2f}x < {VOL_MULT}x (low participation)", False
+
+    # 2) Directional conviction check
+    is_strong = ratio >= VOL_STRONG
+    if side == "LONG":
+        bullish_close = c >= o
+        wick_reject = dn_wick > body and c >= o  # bought back up on volume
+        if bullish_close or wick_reject:
+            return True, f"vol {ratio:.2f}x buy-conviction", is_strong
+        return False, f"vol {ratio:.2f}x but candle bearish (no buy conviction)", False
+    else:  # SHORT
+        bearish_close = c <= o
+        wick_reject = up_wick > body and c <= o  # sold back down on volume
+        if bearish_close or wick_reject:
+            return True, f"vol {ratio:.2f}x sell-conviction", is_strong
+        return False, f"vol {ratio:.2f}x but candle bullish (no sell conviction)", False
+
 def candle_signal(df, i):
     if i < 1:
         return None
@@ -495,6 +563,14 @@ def bot_decide(df, i, labeled, bos, choch, zones):
         if risk <= 0 or reward / risk < min_rr:
             note_skip(lab, f"FLOOR {floor_here['mid']:.2f} RR {reward/max(risk,1e-9):.2f} < {min_rr}")
             return None
+
+        # ---- VOLUME FILTER (LONG) ----
+        vpass, vnote, vstrong = volume_confirms(df, i, "LONG")
+        if not vpass:
+            note_skip(lab, f"FLOOR {floor_here['mid']:.2f} vol-reject: {vnote}")
+            return None
+        # ---- end volume filter ----
+
         tag = "double-bottom override" if trend == "BEAR" else trend
         how = "hold-reject" if trig == "hold" else tag
         return {
@@ -502,7 +578,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             "zone_mid": floor_here["mid"],
             "why": (f"{how} | FLOOR {floor_here['mid']:.2f} "
                     f"({floor_here['low_touches']}L/{floor_here['touches']}x) "
-                    f"| RR {reward/risk:.1f}"),
+                    f"| RR {reward/risk:.1f} | {vnote}"
+                    + (" ⚡STRONG" if vstrong else "")),
         }
 
     if ceil_here is not None and floor_here is None:
@@ -542,6 +619,14 @@ def bot_decide(df, i, labeled, bos, choch, zones):
         if risk <= 0 or reward / risk < min_rr:
             note_skip(lab, f"CEIL {ceil_here['mid']:.2f} RR {reward/max(risk,1e-9):.2f} < {min_rr}")
             return None
+
+        # ---- VOLUME FILTER (SHORT) ----
+        vpass, vnote, vstrong = volume_confirms(df, i, "SHORT")
+        if not vpass:
+            note_skip(lab, f"CEIL {ceil_here['mid']:.2f} vol-reject: {vnote}")
+            return None
+        # ---- end volume filter ----
+
         tag = "double-top override" if trend == "BULL" else trend
         how = "hold-reject" if trig == "hold" else tag
         return {
@@ -549,7 +634,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             "zone_mid": ceil_here["mid"],
             "why": (f"{how} | CEILING {ceil_here['mid']:.2f} "
                     f"({ceil_here['high_touches']}H/{ceil_here['touches']}x) "
-                    f"| RR {reward/risk:.1f}"),
+                    f"| RR {reward/risk:.1f} | {vnote}"
+                    + (" ⚡STRONG" if vstrong else "")),
         }
     return None
 
@@ -654,7 +740,7 @@ def advance(steps):
 
 def badge(fig, x, y, text, pal, yshift=0, arrow=False):
     fig.add_annotation(
-        x=x, y=y, text=f"<b>{text}</b>",
+        x=x, y=y, text=f"<b>{text}</b>", row=1, col=1,
         showarrow=arrow, arrowhead=2, arrowsize=1, arrowwidth=1.4,
         arrowcolor="#111111", yshift=yshift,
         font=dict(size=11, color=pal["fg"], family="Arial"),
@@ -662,11 +748,10 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v11")
+st.title("🤖 Auto-Trader Bot — Trial v12 (+Volume)")
 st.caption(
-    "Same rules every session. **BOS poison = break beyond the zone extreme**, not overlap. "
-    "Wick can tag. Closer/stronger shelf wins. In-band stop. One-bite after TP. "
-    "Open **Last skips** if the day is blank."
+    "v11 structure logic + **volume confirmation filter**. Volume gate = participation "
+    "(vol ≥ ×VolMA) + directional conviction. Toggle in sidebar for A/B testing."
 )
 
 st.sidebar.header("Setup")
@@ -674,8 +759,15 @@ ticker = st.sidebar.text_input("Ticker", "QQQ").upper()
 day = st.sidebar.date_input("Date", datetime.now().date() - timedelta(days=2))
 show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
+
+st.sidebar.markdown("---")
+VOL_FILTER_ON = st.sidebar.checkbox("🔊 Volume filter ON", value=True)
+VOL_MULT = st.sidebar.slider("Min volume ratio (× VolMA)", 1.0, 2.5, 1.15, 0.05)
+st.sidebar.caption(
+    "Trigger candle volume must exceed this × 20-bar VolMA. Toggle OFF to A/B test."
+)
 st.sidebar.markdown(
-    "BOS beyond extreme · wick tag · in-band stop · skip log"
+    "BOS beyond extreme · wick tag · in-band stop · vol filter · skip log"
 )
 
 raw = fetch_session(ticker, day)
@@ -717,12 +809,31 @@ if st.session_state.active and len(st.session_state.df) > 0:
     )
     c4.metric("Trend (last BOS / CHoCH)", trend)
 
-    fig = go.Figure([go.Candlestick(
+    # --- 2-row layout: price (75%) + volume (25%) ---
+    vol_colors = np.where(
+        vis["close"] >= vis["open"],
+        "rgba(38,166,154,0.5)", "rgba(239,83,80,0.5)"
+    )
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03, row_heights=[0.75, 0.25])
+
+    fig.add_trace(go.Candlestick(
         x=vis["label"], open=vis["open"], high=vis["high"],
         low=vis["low"], close=vis["close"], name="price",
         increasing=dict(line=dict(color="#15803d"), fillcolor="#22c55e"),
         decreasing=dict(line=dict(color="#b91c1c"), fillcolor="#ef4444"),
-    )])
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=vis["label"], y=vis["volume"], marker_color=vol_colors, name="Volume",
+    ), row=2, col=1)
+
+    if len(vis) >= VOL_MA_LEN:
+        vma_line = vis["volume"].rolling(VOL_MA_LEN).mean()
+        fig.add_trace(go.Scatter(
+            x=vis["label"], y=vma_line,
+            line=dict(color="#FF6D00", width=2), name="VolMA",
+        ), row=2, col=1)
 
     if show_struct:
         for s in conf:
@@ -759,9 +870,10 @@ if st.session_state.active and len(st.session_state.df) > 0:
                 col, tag = "#a16207", "BOTH"
             else:
                 col, tag = C_BROKEN, role.replace("_", " ").upper()
-            fig.add_hline(y=z["mid"], line=dict(color=col, width=min(1 + z["touches"], 4), dash="dot"))
+            fig.add_hline(y=z["mid"], row=1, col=1,
+                          line=dict(color=col, width=min(1 + z["touches"], 4), dash="dot"))
             fig.add_annotation(
-                x=last_x, y=z["mid"], xanchor="left", xref="x",
+                x=last_x, y=z["mid"], xanchor="left", xref="x", row=1, col=1,
                 text=(f"<b> {z['mid']:.2f} {tag} "
                       f"{z['low_touches']}L/{z['high_touches']}H</b>"),
                 showarrow=False,
@@ -770,8 +882,10 @@ if st.session_state.active and len(st.session_state.df) > 0:
             )
 
     if st.session_state.side:
-        fig.add_hline(y=st.session_state.sl, line=dict(color="#ea580c", width=2, dash="dash"))
-        fig.add_hline(y=st.session_state.tp, line=dict(color="#0369a1", width=2, dash="dash"))
+        fig.add_hline(y=st.session_state.sl, row=1, col=1,
+                      line=dict(color="#ea580c", width=2, dash="dash"))
+        fig.add_hline(y=st.session_state.tp, row=1, col=1,
+                      line=dict(color="#0369a1", width=2, dash="dash"))
 
     for t, p, kind in st.session_state.markers:
         sym = {"LONG": "triangle-up", "SHORT": "triangle-down",
@@ -781,17 +895,29 @@ if st.session_state.active and len(st.session_state.df) > 0:
         fig.add_trace(go.Scatter(
             x=[t], y=[p], mode="markers", showlegend=False,
             marker=dict(symbol=sym, size=13, color=col, line=dict(width=1, color="#111111")),
-        ))
+        ), row=1, col=1)
 
     fig.update_layout(
-        template="plotly_white", height=660, dragmode="pan",
+        template="plotly_white", height=720, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v11 session-only | {trend}",
-        margin=dict(r=160),
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v12+vol | {trend}",
+        margin=dict(r=160), showlegend=False,
     )
-    fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb", linecolor="#111111")
-    fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111111")
+    for r in (1, 2):
+        fig.update_xaxes(type="category", nticks=12, gridcolor="#e5e7eb",
+                         linecolor="#111111", row=r, col=1)
+    fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111111", row=1, col=1)
+
+    # cap volume axis so opening spike doesn't crush the rest
+    if len(vis) and vis["volume"].max() > 0:
+        cap = max(vis["volume"].quantile(0.95) * 1.15, vis["volume"].median() * 2)
+        fig.update_yaxes(range=[0, cap], gridcolor="#e5e7eb",
+                         linecolor="#111111", title_text="Volume", row=2, col=1)
+    else:
+        fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111111",
+                         title_text="Volume", row=2, col=1)
+
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
     a1, a2, a3, _ = st.columns([1, 1, 1, 3])
