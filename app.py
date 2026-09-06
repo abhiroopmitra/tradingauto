@@ -1,8 +1,10 @@
 # ============================================================
-#  BOT TRIAL APP v12
-#  v11 logic + VOLUME: chart panel + volume-confirmation filter.
-#  Volume filter = participation gate + directional conviction.
-#  Toggle in sidebar for A/B testing. Fail-open on bad vol data.
+#  BOT TRIAL APP v13
+#  v11 structure logic + STRUCTURE-AWARE volume filter (Option 2).
+#  3 modes: OFF / Blanket / Smart.
+#    - Smart: strong structural setups (double-B/T override, high-touch
+#      zones) SKIP the volume check. Everything else is volume-gated.
+#  Volume chart panel included. A/B/C test via sidebar.
 # ============================================================
 import streamlit as st
 import plotly.graph_objects as go
@@ -12,7 +14,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v12")
+st.set_page_config(layout="wide", page_title="🤖 S&R Auto-Trader Bot v13")
 
 TRADE_AMT = 200.0
 SWING_K = 5
@@ -37,8 +39,12 @@ POLARITY_EDGE = 2
 VOL_MA_LEN     = 20      # Volume moving-average lookback
 VOL_MULT       = 1.15    # Trigger candle vol must be >= this × VolMA to confirm
 VOL_STRONG     = 1.8     # >= this × VolMA counts as a "conviction" bar
-VOL_FILTER_ON  = True    # master toggle (also exposed in sidebar)
+VOL_MODE       = "Smart" # "Off" / "Blanket" / "Smart" (overridden by sidebar)
 VOL_MIN_BARS   = VOL_MA_LEN
+# Smart-mode: a setup is "strong structural" (skip vol check) if it's a
+# double-bottom/top override, OR the zone touch-count on the traded side
+# is at/above this threshold.
+SMART_STRONG_TOUCHES = HOLD_TOUCHES  # 5+ touches = trust structure, skip vol
 
 C_HH = dict(fg="#ffffff", bg="#166534")
 C_LH = dict(fg="#ffffff", bg="#991b1b")
@@ -369,36 +375,28 @@ def note_skip(t, reason):
     st.session_state.skips = s[-20:]
 
 # ==========================================
-# VOLUME HELPERS
+# VOLUME HELPERS (Structure-aware, Option 2)
 # ==========================================
 def volume_context(df, i):
-    """Returns volume stats for bar i vs its trailing MA.
-    Safe against missing/zero volume (fail-open)."""
+    """Volume stats for bar i vs its trailing MA. Fail-open on bad data."""
     if "volume" not in df.columns:
-        return {"ok": True, "ratio": 1.0, "vma": 0.0, "vol": 0.0, "has_vol": False}
+        return {"ratio": 1.0, "vma": 0.0, "vol": 0.0, "has_vol": False}
     vraw = df["volume"].iloc[i]
     vol = float(vraw) if not pd.isna(vraw) else 0.0
-    lookback = df["volume"].iloc[max(0, i - VOL_MA_LEN): i]  # trailing, excludes current
+    lookback = df["volume"].iloc[max(0, i - VOL_MA_LEN): i]
     vma = float(lookback.mean()) if len(lookback) else 0.0
     if vma <= 0:
-        return {"ok": True, "ratio": 1.0, "vma": vma, "vol": vol, "has_vol": False}
-    ratio = vol / vma
-    return {"ok": True, "ratio": ratio, "vma": vma, "vol": vol, "has_vol": True}
+        return {"ratio": 1.0, "vma": vma, "vol": vol, "has_vol": False}
+    return {"ratio": vol / vma, "vma": vma, "vol": vol, "has_vol": True}
 
 def volume_confirms(df, i, side):
-    """The core volume filter.
-    LONG  wants buying pressure: up-candle OR high-vol lower-wick rejection.
-    SHORT wants selling pressure: down-candle OR high-vol upper-wick rejection.
-    Returns (passed: bool, note: str, is_strong: bool)."""
-    if not VOL_FILTER_ON:
-        return True, "vol-filter off", False
+    """Core participation + directional-conviction check.
+    Returns (passed, note, is_strong)."""
     if i < VOL_MIN_BARS:
         return True, "vol-warmup", False
-
     vc = volume_context(df, i)
     if not vc["has_vol"]:
-        return True, "no-vol-data", False  # fail-open on bad data
-
+        return True, "no-vol-data", False
     ratio = vc["ratio"]
     o = float(df["open"].iloc[i]); c = float(df["close"].iloc[i])
     h = float(df["high"].iloc[i]); l = float(df["low"].iloc[i])
@@ -406,24 +404,56 @@ def volume_confirms(df, i, side):
     up_wick = h - max(o, c)
     dn_wick = min(o, c) - l
 
-    # 1) Participation gate: the move must have volume behind it
     if ratio < VOL_MULT:
         return False, f"vol {ratio:.2f}x < {VOL_MULT}x (low participation)", False
 
-    # 2) Directional conviction check
     is_strong = ratio >= VOL_STRONG
     if side == "LONG":
-        bullish_close = c >= o
-        wick_reject = dn_wick > body and c >= o  # bought back up on volume
-        if bullish_close or wick_reject:
+        if c >= o or (dn_wick > body and c >= o):
             return True, f"vol {ratio:.2f}x buy-conviction", is_strong
         return False, f"vol {ratio:.2f}x but candle bearish (no buy conviction)", False
     else:  # SHORT
-        bearish_close = c <= o
-        wick_reject = up_wick > body and c <= o  # sold back down on volume
-        if bearish_close or wick_reject:
+        if c <= o or (up_wick > body and c <= o):
             return True, f"vol {ratio:.2f}x sell-conviction", is_strong
         return False, f"vol {ratio:.2f}x but candle bullish (no sell conviction)", False
+
+def is_strong_structural(side, zone, trend, trig):
+    """Smart-mode: which setups are strong enough to SKIP the volume check.
+    - Double-bottom/top override (counter-trend into a proven zone) = strong structure.
+    - High-touch zone hold (>= SMART_STRONG_TOUCHES on the traded side) = strong.
+    - hold-reject trigger on a high-touch zone = strong.
+    """
+    side_touches = zone["low_touches"] if side == "LONG" else zone["high_touches"]
+    # double-bottom/top override
+    if side == "LONG" and trend == "BEAR":
+        return True, "double-bottom (structure trusted)"
+    if side == "SHORT" and trend == "BULL":
+        return True, "double-top (structure trusted)"
+    # high-touch zone
+    if side_touches >= SMART_STRONG_TOUCHES:
+        return True, f"high-touch zone {side_touches}x (structure trusted)"
+    # hold-reject on strong shelf
+    if trig == "hold" and side_touches >= HOLD_TOUCHES:
+        return True, "hold-reject strong shelf (structure trusted)"
+    return False, ""
+
+def apply_volume_filter(df, i, side, zone, trend, trig, vol_mode):
+    """Returns (passed, note). Dispatches by mode.
+    Off     -> always pass.
+    Blanket -> always run volume_confirms.
+    Smart   -> skip volume_confirms for strong structural setups; else run it.
+    """
+    if vol_mode == "Off":
+        return True, "vol-off"
+    if vol_mode == "Blanket":
+        ok, note, strong = volume_confirms(df, i, side)
+        return ok, note + (" ⚡STRONG" if strong else "")
+    # Smart
+    strong_struct, why = is_strong_structural(side, zone, trend, trig)
+    if strong_struct:
+        return True, f"vol-waived: {why}"
+    ok, note, strong = volume_confirms(df, i, side)
+    return ok, note + (" ⚡STRONG" if strong else "")
 
 def candle_signal(df, i):
     if i < 1:
@@ -502,7 +532,7 @@ def resolve_edges(floor_here, ceil_here, lo, hi, close):
         return None, ceil_here
     return None, None
 
-def bot_decide(df, i, labeled, bos, choch, zones):
+def bot_decide(df, i, labeled, bos, choch, zones, vol_mode):
     price = float(df["close"].iloc[i])
     lo = float(df["low"].iloc[i])
     hi = float(df["high"].iloc[i])
@@ -564,8 +594,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             note_skip(lab, f"FLOOR {floor_here['mid']:.2f} RR {reward/max(risk,1e-9):.2f} < {min_rr}")
             return None
 
-        # ---- VOLUME FILTER (LONG) ----
-        vpass, vnote, vstrong = volume_confirms(df, i, "LONG")
+        # ---- STRUCTURE-AWARE VOLUME FILTER (LONG) ----
+        vpass, vnote = apply_volume_filter(df, i, "LONG", floor_here, trend, trig, vol_mode)
         if not vpass:
             note_skip(lab, f"FLOOR {floor_here['mid']:.2f} vol-reject: {vnote}")
             return None
@@ -578,8 +608,7 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             "zone_mid": floor_here["mid"],
             "why": (f"{how} | FLOOR {floor_here['mid']:.2f} "
                     f"({floor_here['low_touches']}L/{floor_here['touches']}x) "
-                    f"| RR {reward/risk:.1f} | {vnote}"
-                    + (" ⚡STRONG" if vstrong else "")),
+                    f"| RR {reward/risk:.1f} | {vnote}"),
         }
 
     if ceil_here is not None and floor_here is None:
@@ -620,8 +649,8 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             note_skip(lab, f"CEIL {ceil_here['mid']:.2f} RR {reward/max(risk,1e-9):.2f} < {min_rr}")
             return None
 
-        # ---- VOLUME FILTER (SHORT) ----
-        vpass, vnote, vstrong = volume_confirms(df, i, "SHORT")
+        # ---- STRUCTURE-AWARE VOLUME FILTER (SHORT) ----
+        vpass, vnote = apply_volume_filter(df, i, "SHORT", ceil_here, trend, trig, vol_mode)
         if not vpass:
             note_skip(lab, f"CEIL {ceil_here['mid']:.2f} vol-reject: {vnote}")
             return None
@@ -634,8 +663,7 @@ def bot_decide(df, i, labeled, bos, choch, zones):
             "zone_mid": ceil_here["mid"],
             "why": (f"{how} | CEILING {ceil_here['mid']:.2f} "
                     f"({ceil_here['high_touches']}H/{ceil_here['touches']}x) "
-                    f"| RR {reward/risk:.1f} | {vnote}"
-                    + (" ⚡STRONG" if vstrong else "")),
+                    f"| RR {reward/risk:.1f} | {vnote}"),
         }
     return None
 
@@ -677,7 +705,7 @@ def _close_short(px, t, kind, reason=""):
     st.session_state.side = None
     st.session_state.zone_mid = None
 
-def advance(steps):
+def advance(steps, vol_mode):
     for _ in range(steps):
         if st.session_state.step >= len(st.session_state.df) - 1:
             st.toast("Session closed.", icon="🔔")
@@ -717,7 +745,7 @@ def advance(steps):
 
         conf = [s for s in labeled if s["i"] + SWING_K <= i]
         zones = build_zones(conf, float(visible["close"].iloc[-1]))
-        decision = bot_decide(visible, i, labeled, bos, choch, zones)
+        decision = bot_decide(visible, i, labeled, bos, choch, zones, vol_mode)
         if decision:
             px = float(c["close"])
             sh = TRADE_AMT / px
@@ -748,10 +776,11 @@ def badge(fig, x, y, text, pal, yshift=0, arrow=False):
         opacity=1, align="center",
     )
 
-st.title("🤖 Auto-Trader Bot — Trial v12 (+Volume)")
+st.title("🤖 Auto-Trader Bot — Trial v13 (Structure-Aware Volume)")
 st.caption(
-    "v11 structure logic + **volume confirmation filter**. Volume gate = participation "
-    "(vol ≥ ×VolMA) + directional conviction. Toggle in sidebar for A/B testing."
+    "v11 structure logic + **Option 2 volume filter**. 3 modes: Off / Blanket / Smart. "
+    "**Smart** trusts strong structural setups (double-B/T, high-touch zones) and skips "
+    "the volume check on them, while gating everything else. A/B/C test in sidebar."
 )
 
 st.sidebar.header("Setup")
@@ -761,13 +790,20 @@ show_struct = st.sidebar.checkbox("Show structure labels", True)
 show_zones = st.sidebar.checkbox("Show S/R zones", True)
 
 st.sidebar.markdown("---")
-VOL_FILTER_ON = st.sidebar.checkbox("🔊 Volume filter ON", value=True)
+VOL_MODE = st.sidebar.radio(
+    "🔊 Volume filter mode",
+    ["Off", "Blanket", "Smart"],
+    index=2,
+    help="Off = no volume. Blanket = gate every trade. "
+         "Smart = trust strong structure, gate the rest.",
+)
 VOL_MULT = st.sidebar.slider("Min volume ratio (× VolMA)", 1.0, 2.5, 1.15, 0.05)
 st.sidebar.caption(
-    "Trigger candle volume must exceed this × 20-bar VolMA. Toggle OFF to A/B test."
+    "Smart mode waives the volume check for double-bottom/top overrides and "
+    "high-touch zones; applies it to everything else."
 )
 st.sidebar.markdown(
-    "BOS beyond extreme · wick tag · in-band stop · vol filter · skip log"
+    "BOS beyond extreme · wick tag · in-band stop · structure-aware vol · skip log"
 )
 
 raw = fetch_session(ticker, day)
@@ -901,7 +937,7 @@ if st.session_state.active and len(st.session_state.df) > 0:
         template="plotly_white", height=720, dragmode="pan",
         paper_bgcolor="#ffffff", plot_bgcolor="#fafafa",
         xaxis_rangeslider_visible=False, font=dict(color="#111111"),
-        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v12+vol | {trend}",
+        title=f"{ticker} {day} | {vis['label'].iloc[-1]} | v13 vol={VOL_MODE} | {trend}",
         margin=dict(r=160), showlegend=False,
     )
     for r in (1, 2):
@@ -909,7 +945,6 @@ if st.session_state.active and len(st.session_state.df) > 0:
                          linecolor="#111111", row=r, col=1)
     fig.update_yaxes(gridcolor="#e5e7eb", linecolor="#111111", row=1, col=1)
 
-    # cap volume axis so opening spike doesn't crush the rest
     if len(vis) and vis["volume"].max() > 0:
         cap = max(vis["volume"].quantile(0.95) * 1.15, vis["volume"].median() * 2)
         fig.update_yaxes(range=[0, cap], gridcolor="#e5e7eb",
@@ -922,11 +957,11 @@ if st.session_state.active and len(st.session_state.df) > 0:
 
     a1, a2, a3, _ = st.columns([1, 1, 1, 3])
     if a1.button("▶️ +1 Min"):
-        advance(1); st.rerun()
+        advance(1, VOL_MODE); st.rerun()
     if a2.button("⏩ +5 Min"):
-        advance(5); st.rerun()
+        advance(5, VOL_MODE); st.rerun()
     if a3.button("⏭️ +15 Min"):
-        advance(15); st.rerun()
+        advance(15, VOL_MODE); st.rerun()
 
     if st.session_state.log:
         with st.expander("📝 Bot Decision Log", expanded=True):
